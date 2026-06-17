@@ -2,6 +2,7 @@
 # cpa-health - Codex 账号健康检查 / 清理
 #
 # 检测: 过期 / 额度耗尽 / 疑似封号 / 高失败率
+# 用量: 时间线柱状图 + 配额百分比估算
 #
 # 用法:
 #   cpa-health                  # 健康检查
@@ -11,37 +12,29 @@
 set -e
 
 CPA_PORT=${CPA_PORT:-8317}
-
-# ---------- 自动检测 ----------
 AUTH_DIR="${CPA_AUTH_DIR:-$HOME/.cli-proxy-api}"
 [ -d "$AUTH_DIR" ] || AUTH_DIR="/root/.cli-proxy-api"
 
-# 找管理密钥 (secret-key)
+# ── 自动找管理密钥: env > .mgmt_key > config.yaml明文 ──
 find_mgmt_key() {
+    [ -n "$CPA_MANAGEMENT_KEY" ] && echo "$CPA_MANAGEMENT_KEY" && return
+    for kf in /root/.cli-proxy-api/.mgmt_key ~/.cli-proxy-api/.mgmt_key; do
+        [ -f "$kf" ] && cat "$kf" && return
+    done
     for cp in /root/cliproxyapi/config.yaml /home/*/cliproxyapi/config.yaml /opt/cliproxyapi/config.yaml; do
         [ -f "$cp" ] || continue
-        # 优先读原始明文 (如果还没被hash), 否则只能靠环境变量
         python3 -c "
 import yaml
 with open('$cp') as f:
-    cfg = yaml.safe_load(f)
-rm = cfg.get('remote-management', {})
-sk = rm.get('secret-key', '')
-# 已hash的话, 检查环境变量
-if sk.startswith('\$2a\$'):
-    import os
-    env_key = os.environ.get('CPA_MANAGEMENT_KEY', '')
-    print(env_key)
-else:
-    print(sk)
-" 2>/dev/null && return
+    sk = yaml.safe_load(f).get('remote-management',{}).get('secret-key','')
+if not sk.startswith('\$2a\$'): print(sk)
+" 2>/dev/null | grep -v '^\$' && return
     done
 }
 
 MGMT_KEY="${CPA_MANAGEMENT_KEY:-$(find_mgmt_key)}"
 
-CLEAN_MODE=false
-FORCE=false
+CLEAN_MODE=false; FORCE=false
 for arg in "$@"; do
     case "$arg" in
         --clean) CLEAN_MODE=true ;;
@@ -59,7 +52,6 @@ python3 << PYEOF
 import json, os, sys, base64, time, subprocess
 from pathlib import Path
 from datetime import datetime, timezone
-from collections import defaultdict
 
 AUTH_DIR = Path("$AUTH_DIR")
 MGMT_KEY = "$MGMT_KEY"
@@ -70,146 +62,131 @@ now = time.time()
 
 def decode_jwt(token):
     try:
-        payload = token.split(".")[1]
-        payload += "=" * (4 - len(payload) % 4)
-        return json.loads(base64.urlsafe_b64decode(payload))
-    except:
-        return {}
+        p = token.split(".")[1]; p += "=" * (4 - len(p) % 4)
+        return json.loads(base64.urlsafe_b64decode(p))
+    except: return {}
 
 def fetch_auth_status():
-    """从 CPA 管理 API 获取实时状态"""
-    if not MGMT_KEY:
-        return {}
+    if not MGMT_KEY: return {}
     try:
-        r = subprocess.run([
-            "curl", "-s", "--max-time", "5",
-            "-H", f"X-Management-Key: {MGMT_KEY}",
-            f"http://127.0.0.1:{CPA_PORT}/v0/management/auth-files"
-        ], capture_output=True, text=True)
-        data = json.loads(r.stdout)
-        status_map = {}
-        for f in data.get("files", []):
-            email = f.get("email", "")
-            if email:
-                status_map[email] = f
-        return status_map
-    except:
-        return {}
+        r = subprocess.run(["curl","-s","--max-time","5",
+            "-H",f"X-Management-Key: {MGMT_KEY}",
+            f"http://127.0.0.1:{CPA_PORT}/v0/management/auth-files"],
+            capture_output=True, text=True)
+        return {f["email"]: f for f in json.loads(r.stdout).get("files",[]) if f.get("email")}
+    except: return {}
 
-# ----- 获取 CPA 实时状态 -----
 api_status = fetch_auth_status()
-if api_status:
-    print(f"📡 已连接 CPA 管理 API")
-else:
-    print(f"⚠ 未连接 CPA 管理 API (仅检查 JWT 过期)")
+print(f"📡 {'已连接' if api_status else '⚠ 未连接'} CPA 管理 API{' (仅检查JWT)' if not api_status else ''}")
 print()
 
-# ----- 扫描本地文件 -----
 files = sorted(AUTH_DIR.glob("*.json"))
-if not files:
-    print("未找到 auth 文件")
-    sys.exit(0)
+if not files: print("未找到 auth 文件"); sys.exit(0)
 
+# ── 用量时间线 + 配额估算 ──
+PLAN_CAPS = {"free": 100, "pro": 500, "max": 2000, "team": 2000}
+
+def quota_info(live, plan):
+    if not live: return "", "", ""
+    recent = live.get("recent_requests", [])
+    if not recent: return "", "", ""
+
+    # 时间线 (最近12格)
+    slots = recent[-12:]
+    chars = []
+    for r in slots:
+        s, f = r.get("success",0), r.get("failed",0)
+        if s>0 and f==0: chars.append("█")
+        elif f>0 and s==0: chars.append("✗")
+        elif s>0 and f>0: chars.append("▦")
+        else: chars.append("·")
+    ts = sum(r.get("success",0) for r in slots)
+    tf_ = sum(r.get("failed",0) for r in slots)
+    timeline = f"{''.join(chars)} {ts}✓{tf_}✗"
+
+    # 配额估算: 跟踪窗口(~3h) → 推算全天
+    all_s = sum(r.get("success",0) for r in recent)
+    all_f = sum(r.get("failed",0) for r in recent)
+    if len(recent) < 3 or all_s + all_f == 0:
+        return timeline, "", ""
+
+    hours = len(recent) * 10 / 60
+    daily = (all_s + all_f) * (24 / max(hours, 1))
+    cap = PLAN_CAPS.get(plan, 100)
+    pct = min(100, int(daily / cap * 100))
+    n = 6
+    f_ = min(n, max(1, int(pct/100*n)))
+    bar = f"{'█'*f_}{'░'*(n-f_)} {pct}%"
+    return timeline, pct, bar
+
+# ── 分析每个账号 ──
 total = 0
-results = []  # [(email, issues[], severity, filepath)]
+results = []
 
 for f in files:
     try:
-        with open(f) as fh:
-            data = json.load(fh)
-    except:
-        continue
-
-    if data.get("type") != "codex":
-        continue
-
+        with open(f) as fh: data = json.load(fh)
+    except: continue
+    if data.get("type") != "codex": continue
     total += 1
-    email = data.get("email", "?")
-    plan = data.get("plan_type", "free")
-    issues = []
-    severity = "ok"  # ok, warn, bad, banned
 
-    # ----- JWT 过期检查 -----
-    token = data.get("access_token", "")
-    jwt_exp = 0
+    email = data.get("email","?")
+    plan = data.get("plan_type","free")
+    issues = []
+    severity = "ok"
+
+    # JWT 过期
+    token = data.get("access_token","")
     jwt_days = 0
     if token:
         jwt = decode_jwt(token)
-        jwt_exp = jwt.get("exp", 0)
-        if jwt_exp:
-            jwt_days = (jwt_exp - now) / 86400
+        exp = jwt.get("exp",0)
+        if exp:
+            jwt_days = (exp - now) / 86400
             if jwt_days < 0:
-                issues.append("JWT已过期")
-                severity = "bad"
+                issues.append("JWT已过期"); severity = "bad"
             elif jwt_days < 3:
                 issues.append(f"JWT {jwt_days:.0f}天后过期")
-                if severity == "ok":
-                    severity = "warn"
+                if severity == "ok": severity = "warn"
 
-    # ----- 业务过期检查 -----
-    expired_str = data.get("expired", "?")
-    if expired_str and expired_str != "?":
+    # 业务过期
+    es = data.get("expired","?")
+    if es and es != "?":
         try:
-            exp_dt = datetime.fromisoformat(expired_str.replace("Z", "+00:00"))
-            if exp_dt.timestamp() < now:
-                issues.append("账号标记过期")
-                severity = "bad"
-        except:
-            pass
+            ed = datetime.fromisoformat(es.replace("Z","+00:00"))
+            if ed.timestamp() < now:
+                issues.append("账号标记过期"); severity = "bad"
+        except: pass
 
-    # ----- CPA 实时状态 -----
+    # CPA 实时状态
     live = api_status.get(email, {})
+    all_time_s = all_time_f = 0
     if live:
-        recent = live.get("recent_requests", [])
-        # 全部时间槽
-        all_slots = [(r.get("success", 0), r.get("failed", 0)) for r in recent]
-        total_s = sum(s for s, f in all_slots)
-        total_f = sum(f for s, f in all_slots)
+        recent = live.get("recent_requests",[])
+        all_slots = [(r.get("success",0), r.get("failed",0)) for r in recent]
+        total_s = sum(s for s,_ in all_slots)
+        total_f = sum(f for _,f in all_slots)
         total_r = total_s + total_f
+        r30_s = sum(s for s,_ in all_slots[-3:])
+        r30_f = sum(f for _,f in all_slots[-3:])
+        r60_s = sum(s for s,_ in all_slots[-6:])
+        r60_f = sum(f for _,f in all_slots[-6:])
 
-        # 最近 30 分钟
-        recent_slots = all_slots[-3:]
-        r30_s = sum(s for s, f in recent_slots)
-        r30_f = sum(f for s, f in recent_slots)
-
-        # 最近 60 分钟
-        recent_slots_60 = all_slots[-6:]
-        r60_s = sum(s for s, f in recent_slots_60)
-        r60_f = sum(f for s, f in recent_slots_60)
-
-        # 最近有过请求才分析
-        has_traffic = total_r > 0 or live.get("unavailable") or live.get("disabled")
-
-        if has_traffic:
-            # ── CPA 标记不可用 ──
+        if total_r > 0 or live.get("unavailable") or live.get("disabled"):
             if live.get("unavailable"):
-                # 被 CPA 冷却了，看原因
-                if r60_s > 0:
-                    issues.append("CPA冷却中(曾可用)")
-                    if severity == "ok": severity = "warn"
-                elif r60_f > 0:
-                    issues.append("额度耗尽/冷却中")
-                    severity = "warn"
-                else:
-                    issues.append("CPA标记不可用")
-                    if severity == "ok": severity = "warn"
+                if r60_s > 0: issues.append("CPA冷却中(曾可用)")
+                elif r60_f > 0: issues.append("额度耗尽/冷却中")
+                else: issues.append("CPA标记不可用")
+                if severity == "ok": severity = "warn"
 
             if live.get("disabled"):
-                issues.append("已禁用")
-                severity = "bad"
+                issues.append("已禁用"); severity = "bad"
 
-            # ── 封号检测 ──
-            # 特征: 有失败但从未成功过 (长期全失败)
+            # 封号: 从未成功, 只有失败
             if total_s == 0 and total_f >= 2:
-                if r60_f >= 2:
-                    issues.append(f"🚫 疑似封号: 累计{total_f}次全失败")
-                    severity = "banned"
-                elif total_f >= 3:
-                    issues.append(f"🚫 疑似封号: 累计{total_f}次全失败")
-                    severity = "banned"
-
-            # ── 额度耗尽检测 ──
-            # 特征: 曾成功过但现在连续失败 (CPA round-robin 下可能只有1-2次失败就被跳过)
+                issues.append(f"🚫 疑似封号: 累计{total_f}次全失败")
+                severity = "banned"
+            # 额度耗尽: 曾成功, 最近全失败
             elif total_s > 0 and r30_s == 0 and r30_f >= 1:
                 issues.append("额度耗尽: 最近无成功")
                 if severity == "ok": severity = "warn"
@@ -217,184 +194,83 @@ for f in files:
                 issues.append("额度耗尽: 最近全部失败")
                 if severity == "ok": severity = "warn"
 
-            # ── 比率检查 (累计) ──
+            # 失败率
             if total_r >= 5 and total_f > 0 and severity == "ok":
-                fail_rate = total_f / total_r
-                if fail_rate >= 0.3:
-                    issues.append(f"失败率偏高: {total_f}/{total_r}")
-                    if severity == "ok": severity = "warn"
-                elif fail_rate >= 0.6:
-                    issues.append(f"高失败率: {total_f}/{total_r}")
-                    severity = "bad"
+                fr = total_f / total_r
+                if fr >= 0.6: issues.append(f"高失败率: {total_f}/{total_r}"); severity = "bad"
+                elif fr >= 0.3: issues.append(f"失败率偏高: {total_f}/{total_r}"); severity = "warn"
 
-        status_msg = live.get("status_message", "")
-        if status_msg:
-            issues.append(f"状态: {status_msg}")
-
-        # 累计统计
-        all_time_s = live.get("success", 0)
-        all_time_f = live.get("failed", 0)
-    else:
-        all_time_s = all_time_f = 0
+        sm = live.get("status_message","")
+        if sm: issues.append(f"状态: {sm}")
+        all_time_s = live.get("success",0)
+        all_time_f = live.get("failed",0)
 
     results.append((email, plan, severity, issues, jwt_days, f, all_time_s, all_time_f, live))
 
-# ── 用量时间线 + 配额估算 (模拟管理面板) ──
-# 免费 Codex 估算每日上限
-PLAN_CAPS = {"free": 100, "pro": 500, "max": 2000, "team": 2000}
-
-def usage_timeline_and_quota(live, plan):
-    """
-    返回 (timeline_str, quota_pct, quota_bar)
-    timeline: 最近12槽的用量柱状图
-    quota: 基于跟踪窗口推算的当日用量百分比
-    """
-    if not live:
-        return "", None, ""
-
-    recent = live.get("recent_requests", [])
-    if not recent:
-        return "", None, ""
-
-    # ── 时间线 (最近12格 = 2小时) ──
-    slots = recent[-12:]
-    chars = []
-    for r in slots:
-        s, f = r.get("success", 0), r.get("failed", 0)
-        if s > 0 and f == 0:     chars.append("█")
-        elif f > 0 and s == 0:   chars.append("✗")
-        elif s > 0 and f > 0:    chars.append("▦")
-        else:                    chars.append("·")
-
-    total_s = sum(r.get("success", 0) for r in slots)
-    total_f = sum(r.get("failed", 0) for r in slots)
-    timeline = f"{''.join(chars)} {total_s}✓{total_f}✗"
-
-    # ── 配额估算 ──
-    # 用全部跟踪窗口 (~3h) 推算全天用量
-    all_s = sum(r.get("success", 0) for r in recent)
-    all_f = sum(r.get("failed", 0) for r in recent)
-    num_slots = len(recent)
-    if num_slots < 3 or all_s + all_f == 0:
-        return timeline, None, ""
-
-    hours_tracked = num_slots * 10 / 60
-    daily_est = (all_s + all_f) * (24 / max(hours_tracked, 1))
-    cap = PLAN_CAPS.get(plan, 100)
-    pct = min(100, int(daily_est / cap * 100))
-
-    # 配额条: 6格 + 百分比
-    bar_len = 6
-    filled = min(bar_len, max(1, int(pct / 100 * bar_len)))
-    bar = f"{'█' * filled}{'░' * (bar_len - filled)} {pct}%"
-
-    return timeline, pct, bar
-
-# 排序: 状态 + 最近活跃度
+# ── 排序 ──
 def sort_key(r):
-    email, plan, sev, issues, jwt_days, f, ok_c, fail_c, live = r
-    sev_order = {"banned": 0, "bad": 1, "warn": 2, "ok": 3}
-    recent = live.get("recent_requests", []) if live else []
+    _, _, sev, _, _, _, ok_c, fail_c, live = r
+    sev_order = {"banned":0,"bad":1,"warn":2,"ok":3}
+    recent = live.get("recent_requests",[]) if live else []
     r_total = sum(rr.get("success",0)+rr.get("failed",0) for rr in recent[-6:])
-    return (sev_order.get(sev, 9), -r_total)
-
+    return (sev_order.get(sev,9), -r_total)
 results.sort(key=sort_key)
 
 # ── 显示 ──
-status_icon = {"ok": "✓", "warn": "⚠", "bad": "✗", "banned": "🚫"}
-ok_count = warn_count = bad_count = banned_count = 0
+icons = {"ok":"✓","warn":"⚠","bad":"✗","banned":"🚫"}
+ok_n = warn_n = bad_n = banned_n = 0
 
 for email, plan, sev, issues, jwt_days, f, ok_c, fail_c, live in results:
-    icon = status_icon.get(sev, "?")
+    icon = icons.get(sev,"?")
+    timeline, pct, quota_bar = quota_info(live, plan)
 
-    # 用量时间线 + 配额
-    timeline, pct, quota_bar = usage_timeline_and_quota(live, plan) if live else ("", None, "")
-
-    # 状态标签
     tag = ""
-    if sev in ("bad", "banned", "warn"):
-        pass
-    elif live and live.get("unavailable"):
-        tag = " [额度耗尽]"
-        quota_bar = "██████ 100%"
-    elif ok_c + fail_c == 0:
-        tag = " [新账号]"
-    else:
-        tag = ""
+    if sev not in ("bad","banned","warn"):
+        if live and live.get("unavailable"):
+            tag = " [额度耗尽]"; quota_bar = "██████ 100%"
+        elif ok_c + fail_c == 0:
+            tag = " [新账号]"
 
-    # 显示
     line = f"  {icon} {email}"
-    if timeline:
-        line += f"  {timeline}"
-    if quota_bar:
-        line += f"  {quota_bar}"
+    if timeline: line += f"  {timeline}"
+    if quota_bar: line += f"  {quota_bar}"
     line += f"  JWT:{jwt_days:.0f}d{tag}"
     print(line)
-
     for iss in issues:
         print(f"     ⮡ {iss}")
 
-    # 计数
     if sev == "ok":
-        if live and live.get("unavailable"):
-            warn_count += 1
-        else:
-            ok_count += 1
-    elif sev == "warn":
-        warn_count += 1
-    elif sev == "bad":
-        bad_count += 1
-    elif sev == "banned":
-        banned_count += 1
+        if live and live.get("unavailable"): warn_n += 1
+        else: ok_n += 1
+    elif sev == "warn": warn_n += 1
+    elif sev == "bad": bad_n += 1
+    elif sev == "banned": banned_n += 1
 
 print()
 print("───")
-print(f"总计: {total} | ✓{ok_count} ⚠{warn_count} ✗{bad_count} 🚫{banned_count}")
+print(f"总计: {total} | ✓{ok_n} ⚠{warn_n} ✗{bad_n} 🚫{banned_n}")
 print(f"每格=10min  █成功 ·空闲 ✗失败  配额=当日估算")
 
-# ----- 待清理列表 -----
-to_clean = [r for r in results if r[2] in ("bad", "banned")]
-suggest_clean = [r for r in results if r[2] == "warn"]
-
+# ── 清理 ──
+to_clean = [r for r in results if r[2] in ("bad","banned")]
 if to_clean:
-    print(f"建议清理 ({len(to_clean)} 个):")
+    print(f"\n建议清理 ({len(to_clean)} 个):")
     for r in to_clean:
-        email, plan, sev, issues = r[0], r[1], r[2], r[3]
-        print(f"  {status_icon[sev]} {email}  {'|'.join(issues)}")
-    print()
-
-# ----- 执行清理 -----
-if CLEAN_MODE and to_clean:
-    print(f"将要删除 {len(to_clean)} 个问题账号:")
-    for r in to_clean:
-        email, plan, sev, issues = r[0], r[1], r[2], r[3]
-        print(f"  - {email}")
-        print(f"    {'|'.join(issues)}")
-
-    if not FORCE:
-        try:
-            resp = input("\n确认删除? [y/N] ").strip().lower()
-        except EOFError:
-            resp = "n"
-        if resp not in ("y", "yes"):
-            print("已取消")
-            sys.exit(0)
-
-    deleted = 0
-    for r in to_clean:
-        f = r[5]  # filepath
-        try:
-            f.unlink()
-            deleted += 1
-        except:
-            pass
-    print(f"\n✅ 已删除 {deleted} 个问题账号")
-    print("   CPA 文件监控会自动感知变更")
-
-elif not to_clean:
-    if not CLEAN_MODE:
-        print("运行 cpa-health --clean 清理问题账号")
-    else:
-        print("没有需要清理的账号")
+        print(f"  {icons[r[2]]} {r[0]}  {'|'.join(r[3])}")
+    if CLEAN_MODE:
+        print(f"\n将要删除 {len(to_clean)} 个问题账号:")
+        for r in to_clean:
+            print(f"  - {r[0]}    {'|'.join(r[3])}")
+        if not FORCE:
+            try: resp = input("\n确认删除? [y/N] ").strip().lower()
+            except EOFError: resp = "n"
+            if resp not in ("y","yes"): print("已取消"); sys.exit(0)
+        for r in to_clean:
+            try: r[5].unlink()
+            except: pass
+        print(f"\n✅ 已删除 {len(to_clean)} 个问题账号")
+        print("   CPA 文件监控会自动感知变更")
+elif not CLEAN_MODE:
+    print("\n运行 cpa-health --clean 清理问题账号")
 
 PYEOF
