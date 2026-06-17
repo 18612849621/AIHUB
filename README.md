@@ -19,14 +19,13 @@ cpa-codex-config        # 生成 Codex CLI 配置 (可直接复制粘贴)
 ### cpa-import 用法
 
 ```bash
-# 设置管理密钥 (必需)
-export CPA_MANAGEMENT_KEY="你的管理密钥"
-
-# 导入目录中所有 JSON 文件
+# 直接导入，无需任何环境变量
 cpa-import /path/to/keys/
 
 # 或导入指定文件
 cpa-import file1.json file2.json
+
+# CPA 通过文件监控自动加载，无需重启
 ```
 
 ## 环境变量
@@ -36,7 +35,8 @@ cpa-import file1.json file2.json
 | `CPA_PORT` | 代理端口 | `8317` |
 | `CPA_URL` | 代理地址 | 自动检测 |
 | `CPA_CONFIG` | config.yaml 路径 | 自动查找 |
-| `CPA_MANAGEMENT_KEY` | CPA 管理密钥 (cpa-import 必需) | 无 |
+| `CPA_MODEL` | cpa-codex-config 默认模型 | `gpt-5.5` |
+| `CPA_AUTH_DIR` | auth 目录 | `~/.cli-proxy-api` |
 
 ## 配置路径自动检测
 
