@@ -239,28 +239,56 @@ for f in files:
 
     results.append((email, plan, severity, issues, jwt_days, f, all_time_s, all_time_f, live))
 
-# ── 用量时间线 (模拟管理面板展示) ──
-def usage_timeline(live, width=12):
-    """最近 N 个时间槽的用量柱状图: █成功 ✗失败 ·空闲"""
-    if not live: return ""
+# ── 用量时间线 + 配额估算 (模拟管理面板) ──
+# 免费 Codex 估算每日上限
+PLAN_CAPS = {"free": 100, "pro": 500, "max": 2000, "team": 2000}
+
+def usage_timeline_and_quota(live, plan):
+    """
+    返回 (timeline_str, quota_pct, quota_bar)
+    timeline: 最近12槽的用量柱状图
+    quota: 基于跟踪窗口推算的当日用量百分比
+    """
+    if not live:
+        return "", None, ""
+
     recent = live.get("recent_requests", [])
-    if not recent: return ""
-    slots = recent[-width:]
+    if not recent:
+        return "", None, ""
+
+    # ── 时间线 (最近12格 = 2小时) ──
+    slots = recent[-12:]
     chars = []
     for r in slots:
         s, f = r.get("success", 0), r.get("failed", 0)
-        if s > 0 and f == 0:
-            chars.append("█")
-        elif f > 0 and s == 0:
-            chars.append("✗")
-        elif s > 0 and f > 0:
-            chars.append("▦")
-        else:
-            chars.append("·")
-    # 总计
+        if s > 0 and f == 0:     chars.append("█")
+        elif f > 0 and s == 0:   chars.append("✗")
+        elif s > 0 and f > 0:    chars.append("▦")
+        else:                    chars.append("·")
+
     total_s = sum(r.get("success", 0) for r in slots)
     total_f = sum(r.get("failed", 0) for r in slots)
-    return f"{''.join(chars)} {total_s}✓{total_f}✗"
+    timeline = f"{''.join(chars)} {total_s}✓{total_f}✗"
+
+    # ── 配额估算 ──
+    # 用全部跟踪窗口 (~3h) 推算全天用量
+    all_s = sum(r.get("success", 0) for r in recent)
+    all_f = sum(r.get("failed", 0) for r in recent)
+    num_slots = len(recent)
+    if num_slots < 3 or all_s + all_f == 0:
+        return timeline, None, ""
+
+    hours_tracked = num_slots * 10 / 60
+    daily_est = (all_s + all_f) * (24 / max(hours_tracked, 1))
+    cap = PLAN_CAPS.get(plan, 100)
+    pct = min(100, int(daily_est / cap * 100))
+
+    # 配额条: 6格 + 百分比
+    bar_len = 6
+    filled = min(bar_len, max(1, int(pct / 100 * bar_len)))
+    bar = f"{'█' * filled}{'░' * (bar_len - filled)} {pct}%"
+
+    return timeline, pct, bar
 
 # 排序: 状态 + 最近活跃度
 def sort_key(r):
@@ -279,8 +307,8 @@ ok_count = warn_count = bad_count = banned_count = 0
 for email, plan, sev, issues, jwt_days, f, ok_c, fail_c, live in results:
     icon = status_icon.get(sev, "?")
 
-    # 时间线
-    timeline = usage_timeline(live) if live else ""
+    # 用量时间线 + 配额
+    timeline, pct, quota_bar = usage_timeline_and_quota(live, plan) if live else ("", None, "")
 
     # 状态标签
     tag = ""
@@ -288,6 +316,7 @@ for email, plan, sev, issues, jwt_days, f, ok_c, fail_c, live in results:
         pass
     elif live and live.get("unavailable"):
         tag = " [额度耗尽]"
+        quota_bar = "██████ 100%"
     elif ok_c + fail_c == 0:
         tag = " [新账号]"
     else:
@@ -297,6 +326,8 @@ for email, plan, sev, issues, jwt_days, f, ok_c, fail_c, live in results:
     line = f"  {icon} {email}"
     if timeline:
         line += f"  {timeline}"
+    if quota_bar:
+        line += f"  {quota_bar}"
     line += f"  JWT:{jwt_days:.0f}d{tag}"
     print(line)
 
@@ -319,7 +350,7 @@ for email, plan, sev, issues, jwt_days, f, ok_c, fail_c, live in results:
 print()
 print("───")
 print(f"总计: {total} | ✓{ok_count} ⚠{warn_count} ✗{bad_count} 🚫{banned_count}")
-print(f"图例: █成功 ·空闲 ✗失败  每格=10分钟  右侧=该时段总计")
+print(f"每格=10min  █成功 ·空闲 ✗失败  配额=当日估算")
 
 # ----- 待清理列表 -----
 to_clean = [r for r in results if r[2] in ("bad", "banned")]
