@@ -237,48 +237,103 @@ for f in files:
     else:
         all_time_s = all_time_f = 0
 
-    results.append((email, plan, severity, issues, jwt_days, f, all_time_s, all_time_f))
+    results.append((email, plan, severity, issues, jwt_days, f, all_time_s, all_time_f, live))
 
 # ----- 显示 -----
 status_icon = {"ok": "✓", "warn": "⚠", "bad": "✗", "banned": "🚫"}
-ok_count = sum(1 for r in results if r[2] == "ok")
-warn_count = sum(1 for r in results if r[2] == "warn")
-bad_count = sum(1 for r in results if r[2] == "bad")
-banned_count = sum(1 for r in results if r[2] == "banned")
 
-for email, plan, sev, issues, jwt_days, f, ok_c, fail_c in results:
-    icon = status_icon.get(sev, "?")
-    print(f"  {icon} {email}")
-    # 请求统计
-    if ok_c + fail_c > 0:
-        print(f"         请求: {ok_c}成功/{fail_c}失败  JWT: {jwt_days:.0f}天")
+# 按状态分组
+groups = {"available": [], "cooling": [], "no_traffic": [], "warn": [], "bad": [], "banned": []}
+for r in results:
+    email, plan, sev, issues, jwt_days, f, ok_c, fail_c, live = r
+    if sev in ("bad", "banned"):
+        groups[sev].append(r)
+    elif sev == "warn":
+        groups["warn"].append(r)
+    elif live and live.get("unavailable"):
+        groups["cooling"].append(r)
+    elif ok_c + fail_c > 0:
+        groups["available"].append(r)
     else:
-        print(f"         JWT有效: {jwt_days:.0f}天  plan={plan}")
-    for iss in issues:
-        print(f"         ⮡ {iss}")
+        groups["no_traffic"].append(r)
 
-print()
-print(f"  总计: {total} | ✓{ok_count} ⚠{warn_count} ✗{bad_count} 🚫{banned_count}")
+# ── 当前可用 ──
+if groups["available"]:
+    print(f"🟢 可用 ({len(groups['available'])} 个)")
+    for email, plan, sev, issues, jwt_days, f, ok_c, fail_c, live in groups["available"]:
+        # 最近30分钟内的请求
+        recent = live.get("recent_requests", []) if live else []
+        r30_s = sum(r.get("success",0) for r in recent[-3:])
+        r30_f = sum(r.get("failed",0) for r in recent[-3:])
+        if r30_s + r30_f > 0:
+            print(f"   {email}  近30m: {r30_s}✓{r30_f}✗  JWT:{jwt_days:.0f}d")
+        else:
+            print(f"   {email}  累计:{ok_c}✓{fail_c}✗  JWT:{jwt_days:.0f}d")
+    print()
+
+# ── 冷却/额度耗尽 ──
+if groups["cooling"]:
+    print(f"🟡 冷却中/额度耗尽 ({len(groups['cooling'])} 个)")
+    for email, plan, sev, issues, jwt_days, f, ok_c, fail_c, live in groups["cooling"]:
+        status_msg = live.get("status_message", "") if live else ""
+        recent = live.get("recent_requests", []) if live else []
+        r60_s = sum(r.get("success",0) for r in recent[-6:])
+        r60_f = sum(r.get("failed",0) for r in recent[-6:])
+        extra = f"  {status_msg}" if status_msg else ""
+        print(f"   {email}  近60m: {r60_s}✓{r60_f}✗  JWT:{jwt_days:.0f}d{extra}")
+    print()
+
+# ── 未使用过 ──
+if groups["no_traffic"]:
+    print(f"⚪ 暂无流量 ({len(groups['no_traffic'])} 个)")
+    for email, plan, sev, issues, jwt_days, f, ok_c, fail_c, live in groups["no_traffic"]:
+        print(f"   {email}  JWT:{jwt_days:.0f}d  plan={plan}")
+    print()
+
+# ── 警告 ──
+if groups["warn"]:
+    print(f"⚠ 警告 ({len(groups['warn'])} 个)")
+    for email, plan, sev, issues, jwt_days, f, ok_c, fail_c, live in groups["warn"]:
+        print(f"   {email}")
+        for iss in issues:
+            print(f"     ⮡ {iss}")
+    print()
+
+# ── 过期/封号 ──
+for sev in ("bad", "banned"):
+    icon = "✗" if sev == "bad" else "🚫"
+    label = "过期" if sev == "bad" else "疑似封号"
+    if groups[sev]:
+        print(f"{icon} {label} ({len(groups[sev])} 个)")
+        for email, plan, sev2, issues, jwt_days, f, ok_c, fail_c, live in groups[sev]:
+            print(f"   {email}")
+            for iss in issues:
+                print(f"     ⮡ {iss}")
+        print()
+
+print(f"───")
+ok_count = len(groups["available"]) + len(groups["no_traffic"])
+warn_count = len(groups["warn"]) + len(groups["cooling"])
+bad_count = len(groups["bad"])
+banned_count = len(groups["banned"])
+print(f"总计: {total} | 🟢{ok_count} 🟡{warn_count} ✗{bad_count} 🚫{banned_count}")
 
 # ----- 待清理列表 -----
 to_clean = [r for r in results if r[2] in ("bad", "banned")]
 suggest_clean = [r for r in results if r[2] == "warn"]
 
 if to_clean:
+    print(f"建议清理 ({len(to_clean)} 个):")
+    for r in to_clean:
+        email, plan, sev, issues = r[0], r[1], r[2], r[3]
+        print(f"  {status_icon[sev]} {email}  {'|'.join(issues)}")
     print()
-    print(f"  建议清理 ({len(to_clean)} 个):")
-    for email, plan, sev, issues, *rest in to_clean:
-        print(f"    {status_icon[sev]} {email}  {'|'.join(issues)}")
-
-if suggest_clean and not CLEAN_MODE:
-    print()
-    print(f"  ⚠ {len(suggest_clean)} 个警告账号 (高失败率/即将过期)")
 
 # ----- 执行清理 -----
 if CLEAN_MODE and to_clean:
-    print()
     print(f"将要删除 {len(to_clean)} 个问题账号:")
-    for email, plan, sev, issues, *rest in to_clean:
+    for r in to_clean:
+        email, plan, sev, issues = r[0], r[1], r[2], r[3]
         print(f"  - {email}")
         print(f"    {'|'.join(issues)}")
 
@@ -292,7 +347,8 @@ if CLEAN_MODE and to_clean:
             sys.exit(0)
 
     deleted = 0
-    for email, plan, sev, issues, jwt_days, f, *rest in to_clean:
+    for r in to_clean:
+        f = r[5]  # filepath
         try:
             f.unlink()
             deleted += 1
@@ -301,13 +357,10 @@ if CLEAN_MODE and to_clean:
     print(f"\n✅ 已删除 {deleted} 个问题账号")
     print("   CPA 文件监控会自动感知变更")
 
-elif not to_clean and not suggest_clean:
-    print()
-    print("  所有账号状态正常 ✓")
-
-elif to_clean and not CLEAN_MODE:
-    print()
-    print("  运行 cpa-health --clean 清理问题账号")
-    print("  运行 cpa-health --clean --force 跳过确认")
+elif not to_clean:
+    if not CLEAN_MODE:
+        print("运行 cpa-health --clean 清理问题账号")
+    else:
+        print("没有需要清理的账号")
 
 PYEOF
