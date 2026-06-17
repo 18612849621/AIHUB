@@ -10,10 +10,13 @@ echo " AIHUB 卸载"
 echo "========================================"
 
 rm -f "$INSTALL_DIR/cpa-status"
-echo "  ✅ 已删除 cpa-status"
-
 rm -f "$INSTALL_DIR/cpa-import"
+rm -f "$INSTALL_DIR/cpa-codex-config"
+rm -f "$INSTALL_DIR/cpa-health"
+echo "  ✅ 已删除 cpa-status"
 echo "  ✅ 已删除 cpa-import"
+echo "  ✅ 已删除 cpa-codex-config"
+echo "  ✅ 已删除 cpa-health"
 
 # 清理 PATH (移除 ~/bin 引用)
 if [ -f ~/.bashrc ]; then

@@ -1,0 +1,155 @@
+#!/bin/bash
+# cpa-health - 检查 Codex 账号健康状态 / 清理过期账号
+#
+# 用法:
+#   cpa-health              # 仅查看状态
+#   cpa-health --clean      # 清理过期账号
+#   cpa-health --clean --force  # 强制清理 (不确认)
+#
+# 环境变量:
+#   CPA_AUTH_DIR  - CPA auth 目录, 默认 ~/.cli-proxy-api
+
+set -e
+
+AUTH_DIR="${CPA_AUTH_DIR:-$HOME/.cli-proxy-api}"
+[ -d "$AUTH_DIR" ] || AUTH_DIR="/root/.cli-proxy-api"
+
+CLEAN_MODE=false
+FORCE=false
+
+for arg in "$@"; do
+    case "$arg" in
+        --clean) CLEAN_MODE=true ;;
+        --force) FORCE=true ;;
+        --help|-h) echo "用法: cpa-health [--clean] [--force]"; exit 0 ;;
+    esac
+done
+
+echo "============================================"
+echo " CPA Codex 账号健康检查"
+echo "============================================"
+echo ""
+echo "Auth 目录: $AUTH_DIR"
+echo ""
+
+# 使用 Python 做 JWT 解析和状态判断
+python3 << PYEOF
+import json, os, sys, base64, time
+from pathlib import Path
+from datetime import datetime, timezone
+
+AUTH_DIR = "$AUTH_DIR"
+CLEAN_MODE = "$CLEAN_MODE" == "true"
+FORCE = "$FORCE" == "true"
+
+def decode_jwt(token):
+    try:
+        payload = token.split(".")[1]
+        payload += "=" * (4 - len(payload) % 4)
+        return json.loads(base64.urlsafe_b64decode(payload))
+    except:
+        return {}
+
+now = time.time()
+files = sorted(Path(AUTH_DIR).glob("*.json"))
+
+if not files:
+    print("未找到 auth 文件")
+    sys.exit(0)
+
+total, active, expired, no_plan, to_delete = 0, 0, 0, 0, []
+
+for f in files:
+    try:
+        with open(f) as fh:
+            data = json.load(fh)
+    except:
+        continue
+
+    if data.get("type") != "codex":
+        continue
+
+    total += 1
+    email = data.get("email", "?")
+    plan = data.get("plan_type", "free")
+    expired_str = data.get("expired", "?")
+
+    # 检查 JWT 过期时间
+    token = data.get("access_token", "")
+    jwt_exp = 0
+    if token:
+        jwt = decode_jwt(token)
+        jwt_exp = jwt.get("exp", 0)
+
+    # 判断状态
+    status = "✓"
+    issues = []
+
+    if jwt_exp and jwt_exp < now:
+        status = "✗"
+        issues.append("JWT已过期")
+    elif expired_str and expired_str != "?":
+        try:
+            exp_dt = datetime.fromisoformat(expired_str.replace("Z", "+00:00"))
+            if exp_dt.timestamp() < now:
+                status = "✗"
+                issues.append("账号已过期")
+            else:
+                days_left = (exp_dt.timestamp() - now) / 86400
+                if days_left < 2:
+                    status = "⚠"
+                    issues.append(f"{days_left:.0f}天后过期")
+        except:
+            pass
+
+    if plan == "free":
+        no_plan += 1
+
+    if status == "✗":
+        expired += 1
+        to_delete.append(f)
+    elif status == "⚠":
+        active += 1
+    else:
+        active += 1
+
+    # 显示行
+    print(f"  {status} {email}")
+    if issues:
+        print(f"         {'|'.join(issues)}  plan={plan}")
+    else:
+        jwt_days = (jwt_exp - now) / 86400 if jwt_exp else 0
+        if jwt_exp:
+            print(f"         JWT有效: {jwt_days:.0f}天  plan={plan}")
+        else:
+            print(f"         plan={plan}")
+
+print()
+print(f"  总计: {total} | 正常: {active} | 已过期: {expired}")
+
+if to_delete and CLEAN_MODE:
+    print()
+    print(f"将要删除 {len(to_delete)} 个过期账号:")
+    for f in to_delete:
+        print(f"  - {f.name}")
+
+    if not FORCE:
+        resp = input("\n确认删除? [y/N] ").strip().lower()
+        if resp not in ("y", "yes"):
+            print("已取消")
+            sys.exit(0)
+
+    deleted = 0
+    for f in to_delete:
+        f.unlink()
+        deleted += 1
+    print(f"\n✅ 已删除 {deleted} 个过期账号")
+    print("   CPA 文件监控会自动感知变更")
+
+elif to_delete and not CLEAN_MODE:
+    print()
+    print(f"  ⚠ {len(to_delete)} 个过期账号待清理")
+    print("  运行 cpa-health --clean 清理")
+    print("  运行 cpa-health --clean --force 跳过确认")
+
+PYEOF

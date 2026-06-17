@@ -28,6 +28,11 @@ cp "$REPO_DIR/cpa/cpa-codex-config" "$INSTALL_DIR/cpa-codex-config"
 chmod +x "$INSTALL_DIR/cpa-codex-config"
 echo "  ✅ cpa-codex-config"
 
+# 安装 cpa-health
+cp "$REPO_DIR/cpa/cpa-health" "$INSTALL_DIR/cpa-health"
+chmod +x "$INSTALL_DIR/cpa-health"
+echo "  ✅ cpa-health"
+
 # 确保 ~/bin 在 PATH 中
 if ! echo "$PATH" | grep -q "$INSTALL_DIR"; then
     if ! grep -q "PATH.*$INSTALL_DIR" ~/.bashrc 2>/dev/null; then
