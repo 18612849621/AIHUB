@@ -239,26 +239,53 @@ for f in files:
 
     results.append((email, plan, severity, issues, jwt_days, f, all_time_s, all_time_f, live))
 
-# ----- 排序: 按状态严重程度 + 使用频率 -----
+# ── 用量时间线 (模拟管理面板展示) ──
+def usage_timeline(live, width=12):
+    """最近 N 个时间槽的用量柱状图: █成功 ✗失败 ·空闲"""
+    if not live: return ""
+    recent = live.get("recent_requests", [])
+    if not recent: return ""
+    slots = recent[-width:]
+    chars = []
+    for r in slots:
+        s, f = r.get("success", 0), r.get("failed", 0)
+        if s > 0 and f == 0:
+            chars.append("█")
+        elif f > 0 and s == 0:
+            chars.append("✗")
+        elif s > 0 and f > 0:
+            chars.append("▦")
+        else:
+            chars.append("·")
+    # 总计
+    total_s = sum(r.get("success", 0) for r in slots)
+    total_f = sum(r.get("failed", 0) for r in slots)
+    return f"{''.join(chars)} {total_s}✓{total_f}✗"
+
+# 排序: 状态 + 最近活跃度
 def sort_key(r):
     email, plan, sev, issues, jwt_days, f, ok_c, fail_c, live = r
     sev_order = {"banned": 0, "bad": 1, "warn": 2, "ok": 3}
-    # 同状态下按累计请求数降序
-    return (sev_order.get(sev, 9), -(ok_c + fail_c))
+    recent = live.get("recent_requests", []) if live else []
+    r_total = sum(rr.get("success",0)+rr.get("failed",0) for rr in recent[-6:])
+    return (sev_order.get(sev, 9), -r_total)
 
 results.sort(key=sort_key)
 
-# ----- 显示 -----
+# ── 显示 ──
 status_icon = {"ok": "✓", "warn": "⚠", "bad": "✗", "banned": "🚫"}
 ok_count = warn_count = bad_count = banned_count = 0
 
 for email, plan, sev, issues, jwt_days, f, ok_c, fail_c, live in results:
     icon = status_icon.get(sev, "?")
 
-    # 实时状态标签
+    # 时间线
+    timeline = usage_timeline(live) if live else ""
+
+    # 状态标签
     tag = ""
     if sev in ("bad", "banned", "warn"):
-        pass  # 已有 icon
+        pass
     elif live and live.get("unavailable"):
         tag = " [额度耗尽]"
     elif ok_c + fail_c == 0:
@@ -266,19 +293,11 @@ for email, plan, sev, issues, jwt_days, f, ok_c, fail_c, live in results:
     else:
         tag = ""
 
-    # 最近流量
-    recent = live.get("recent_requests", []) if live else []
-    r30_s = sum(r.get("success",0) for r in recent[-3:])
-    r30_f = sum(r.get("failed",0) for r in recent[-3:])
-
-    traffic = ""
-    if ok_c + fail_c > 0:
-        if r30_s + r30_f > 0:
-            traffic = f"30m:{r30_s}✓{r30_f}✗"
-        else:
-            traffic = f"累计:{ok_c}✓{fail_c}✗"
-
-    line = f"  {icon} {email}  {traffic}  JWT:{jwt_days:.0f}d{tag}"
+    # 显示
+    line = f"  {icon} {email}"
+    if timeline:
+        line += f"  {timeline}"
+    line += f"  JWT:{jwt_days:.0f}d{tag}"
     print(line)
 
     for iss in issues:
@@ -298,8 +317,9 @@ for email, plan, sev, issues, jwt_days, f, ok_c, fail_c, live in results:
         banned_count += 1
 
 print()
-print(f"───")
+print("───")
 print(f"总计: {total} | ✓{ok_count} ⚠{warn_count} ✗{bad_count} 🚫{banned_count}")
+print(f"图例: █成功 ·空闲 ✗失败  每格=10分钟  右侧=该时段总计")
 
 # ----- 待清理列表 -----
 to_clean = [r for r in results if r[2] in ("bad", "banned")]

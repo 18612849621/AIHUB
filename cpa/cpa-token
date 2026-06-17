@@ -1,0 +1,283 @@
+#!/bin/bash
+# cpa-token - Codex Token 管理 (查看/测试/启禁用)
+#
+# 用法:
+#   cpa-token list               # 列出所有 token
+#   cpa-token info <email>       # 查看某个 token 详情 (JWT 解码)
+#   cpa-token test <email>       # 探测某个 token 是否可用
+#   cpa-token disable <email>    # 禁用一个 token
+#   cpa-token enable <email>     # 启用一个 token
+#   cpa-token test-all           # 探测所有 token 可用性
+
+set -e
+
+CPA_PORT=${CPA_PORT:-8317}
+AUTH_DIR="${CPA_AUTH_DIR:-$HOME/.cli-proxy-api}"
+[ -d "$AUTH_DIR" ] || AUTH_DIR="/root/.cli-proxy-api"
+
+find_mgmt_key() {
+    python3 -c "
+import yaml, os
+for cp in ['/root/cliproxyapi/config.yaml','/opt/cliproxyapi/config.yaml']:
+    try:
+        with open(cp) as f:
+            cfg = yaml.safe_load(f)
+        sk = cfg.get('remote-management',{}).get('secret-key','')
+        if sk and not sk.startswith('\$2a\$'):
+            print(sk)
+            break
+        env_key = os.environ.get('CPA_MANAGEMENT_KEY','')
+        if env_key:
+            print(env_key)
+            break
+    except: pass
+"
+}
+
+MGMT_KEY="${CPA_MANAGEMENT_KEY:-$(find_mgmt_key)}"
+
+cmd="${1:-list}"
+shift 2>/dev/null || true
+
+# ── 辅助函数 ──
+decode_jwt() {
+    python3 -c "
+import json, base64, sys
+token = sys.argv[1]
+try:
+    payload = token.split('.')[1]
+    payload += '=' * (4 - len(payload) % 4)
+    jwt = json.loads(base64.urlsafe_b64decode(payload))
+    print(json.dumps(jwt, indent=2, ensure_ascii=False))
+except Exception as e:
+    print(f'解码失败: {e}')
+" "$1"
+}
+
+# ── list ──
+do_list() {
+    echo "============================================"
+    echo " Token 列表"
+    echo "============================================"
+    echo ""
+    python3 << PYEOF
+import json, base64, time
+from pathlib import Path
+
+AUTH_DIR = Path("$AUTH_DIR")
+now = time.time()
+files = sorted(AUTH_DIR.glob("*.json"))
+i = 0
+
+for f in files:
+    try:
+        with open(f) as fh:
+            data = json.load(fh)
+    except: continue
+    if data.get("type") != "codex": continue
+    i += 1
+    email = data.get("email", "?")
+    plan = data.get("plan_type", "?")
+    token = data.get("access_token", "")
+    jwt_days = 0
+    if token:
+        try:
+            p = token.split(".")[1]; p += "=" * (4 - len(p)%4)
+            jwt = json.loads(base64.urlsafe_b64decode(p))
+            exp = jwt.get("exp", 0)
+            jwt_days = (exp - now) / 86400 if exp else 0
+        except: pass
+
+    status = "✓" if jwt_days > 0 else "✗"
+    print(f"  [{i}] {status} {email}")
+    print(f"      JWT:{jwt_days:.0f}d  plan={plan}  file={f.name}")
+PYEOF
+}
+
+# ── info ──
+do_info() {
+    local email="$1"
+    local f="$AUTH_DIR/${email}.json"
+
+    # 模糊匹配
+    if [ ! -f "$f" ]; then
+        f=$(ls "$AUTH_DIR"/*.json 2>/dev/null | while read p; do
+            python3 -c "import json;d=json.load(open('$p'));exit(0 if '$email' in d.get('email','') else 1)" 2>/dev/null && echo "$p"
+        done | head -1)
+    fi
+
+    if [ -z "$f" ] || [ ! -f "$f" ]; then
+        echo "❌ 未找到: $email"
+        exit 1
+    fi
+
+    echo "============================================"
+    echo " Token 详情"
+    echo "============================================"
+    echo ""
+
+    python3 << PYEOF
+import json, base64, time
+
+with open("$f") as fh:
+    data = json.load(fh)
+
+print(f"文件: $f")
+print(f"Email: {data.get('email','?')}")
+print(f"Type: {data.get('type','?')}")
+print(f"Plan: {data.get('plan_type','?')}")
+print(f"Expired: {data.get('expired','?')}")
+print()
+
+token = data.get("access_token", "")
+if token:
+    print("─── Access Token ───")
+    try:
+        payload = token.split(".")[1]
+        payload += "=" * (4 - len(payload) % 4)
+        jwt = json.loads(base64.urlsafe_b64decode(payload))
+        now = time.time()
+        exp = jwt.get("exp", 0)
+        days = (exp - now) / 86400
+        print(f"  JWT 有效期: {days:.1f} 天")
+        print(f"  过期时间: {time.strftime('%Y-%m-%d %H:%M:%S', time.gmtime(exp))}")
+        print(f"  Client ID: {jwt.get('client_id','?')}")
+        print(f"  Scopes: {jwt.get('scp',[])}")
+        auth = jwt.get("https://api.openai.com/auth", {})
+        print(f"  User ID: {auth.get('user_id','?')}")
+        print(f"  Localhost: {auth.get('localhost')}")
+        print(f"  AMR: {auth.get('amr',[])}")
+    except Exception as e:
+        print(f"  解码失败: {e}")
+
+refresh = data.get("refresh_token", "")
+if refresh:
+    print(f"\n  Refresh Token: 有 ({len(refresh)} bytes)")
+else:
+    print(f"\n  Refresh Token: 无")
+PYEOF
+}
+
+# ── test ──
+do_test() {
+    local email="$1"
+    local f=""
+
+    # 模糊匹配找文件
+    for fp in "$AUTH_DIR"/*.json; do
+        if python3 -c "import json;d=json.load(open('$fp'));exit(0 if '$email' in d.get('email','') else 1)" 2>/dev/null; then
+            f="$fp"; break
+        fi
+    done
+
+    if [ -z "$f" ]; then
+        echo "❌ 未找到: $email"
+        exit 1
+    fi
+
+    local token=$(python3 -c "import json;print(json.load(open('$f')).get('access_token',''))")
+
+    echo -n "探测 $email ... "
+    local code=$(curl -s -o /tmp/cpa_token_test.json -w "%{http_code}" \
+        -H "Authorization: Bearer $token" \
+        -H "Content-Type: application/json" \
+        -d '{"model":"gpt-5.5","input":"hi","max_output_tokens":1}' \
+        "https://api.openai.com/v1/responses" 2>/dev/null)
+
+    case "$code" in
+        200) echo "✅ 可用"
+             python3 -c "import json;d=json.load(open('/tmp/cpa_token_test.json'));print(f'  response: {d.get(\"id\",\"?\")} status={d.get(\"status\",\"?\")}')" 2>/dev/null
+             ;;
+        401) echo "🔐 认证失败 (token无效)"
+             python3 -c "import json;d=json.load(open('/tmp/cpa_token_test.json'));e=d.get('error',{});print(f'  {e.get(\"message\",\"?\")}')" 2>/dev/null
+             ;;
+        403) echo "🚫 权限不足/被封"
+             python3 -c "import json;d=json.load(open('/tmp/cpa_token_test.json'));e=d.get('error',{});print(f'  {e.get(\"message\",\"?\")}')" 2>/dev/null
+             ;;
+        429) echo "⏳ 限流中" ;;
+        *)   echo "❌ HTTP $code" ;;
+    esac
+    rm -f /tmp/cpa_token_test.json
+}
+
+# ── disable / enable ──
+do_toggle() {
+    local action="$1"  # disable or enable
+    local email="$2"
+
+    if [ -z "$MGMT_KEY" ]; then
+        echo "❌ 需要管理密钥: export CPA_MANAGEMENT_KEY=xxx"
+        exit 1
+    fi
+
+    # 找文件
+    local fname=""
+    for fp in "$AUTH_DIR"/*.json; do
+        if python3 -c "import json;d=json.load(open('$fp'));exit(0 if '$email' in d.get('email','') else 1)" 2>/dev/null; then
+            fname=$(basename "$fp"); break
+        fi
+    done
+    [ -z "$fname" ] && { echo "❌ 未找到: $email"; exit 1; }
+
+    local new_val="false"
+    [ "$action" = "disable" ] && new_val="true"
+
+    # 通过管理 API 设置 disabled
+    # CPA 的 auth-files 管理端点
+    local resp=$(curl -s -X PATCH \
+        -H "X-Management-Key: $MGMT_KEY" \
+        -H "Content-Type: application/json" \
+        -d "{\"id\":\"$fname\",\"disabled\":$new_val}" \
+        "http://127.0.0.1:${CPA_PORT}/v0/management/auth-files" 2>/dev/null)
+
+    if echo "$resp" | grep -q '"status":"ok"'; then
+        echo "✅ ${action}d: $email"
+    else
+        echo "❌ 失败: $resp"
+    fi
+}
+
+# ── test-all ──
+do_test_all() {
+    echo "============================================"
+    echo " 批量探测所有 Token"
+    echo "============================================"
+    echo ""
+    local total=0 ok=0 fail=0
+    for fp in "$AUTH_DIR"/*.json; do
+        local email=$(python3 -c "import json;d=json.load(open('$fp'));print(d.get('email','?'))" 2>/dev/null)
+        [ "$email" = "?" ] && continue
+        local t=$(python3 -c "import json;d=json.load(open('$fp'));print(d.get('type',''))" 2>/dev/null)
+        [ "$t" != "codex" ] && continue
+        total=$((total+1))
+
+        echo -n "  "
+        do_test "$email"
+        local last_rc=${PIPESTATUS[0]}
+        if [ $last_rc -eq 0 ]; then ok=$((ok+1)); else fail=$((fail+1)); fi
+    done
+    echo ""
+    echo "───"
+    echo "总计: $total | ✅$ok ❌$fail"
+}
+
+# ── main ──
+case "$cmd" in
+    list)     do_list ;;
+    info)     do_info "${1:-}" ;;
+    test)     do_test "${1:-}" ;;
+    test-all) do_test_all ;;
+    disable)  do_toggle "disable" "${1:-}" ;;
+    enable)   do_toggle "enable" "${1:-}" ;;
+    *)
+        echo "用法: cpa-token {list|info|test|test-all|disable|enable} [email]"
+        echo ""
+        echo "  list              列出所有 token"
+        echo "  info <email>       查看 token 详情 (JWT解码)"
+        echo "  test <email>       探测单个 token 可用性"
+        echo "  test-all           批量探测所有 token"
+        echo "  disable <email>    禁用 token"
+        echo "  enable <email>     启用 token"
+        exit 1
+        ;;
+esac

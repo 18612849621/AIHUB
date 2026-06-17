@@ -13,10 +13,12 @@ rm -f "$INSTALL_DIR/cpa-status"
 rm -f "$INSTALL_DIR/cpa-import"
 rm -f "$INSTALL_DIR/cpa-codex-config"
 rm -f "$INSTALL_DIR/cpa-health"
+rm -f "$INSTALL_DIR/cpa-token"
 echo "  ✅ 已删除 cpa-status"
 echo "  ✅ 已删除 cpa-import"
 echo "  ✅ 已删除 cpa-codex-config"
 echo "  ✅ 已删除 cpa-health"
+echo "  ✅ 已删除 cpa-token"
 
 # 清理 PATH (移除 ~/bin 引用)
 if [ -f ~/.bashrc ]; then

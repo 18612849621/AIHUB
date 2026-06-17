@@ -33,6 +33,11 @@ cp "$REPO_DIR/cpa/cpa-health" "$INSTALL_DIR/cpa-health"
 chmod +x "$INSTALL_DIR/cpa-health"
 echo "  ✅ cpa-health"
 
+# 安装 cpa-token
+cp "$REPO_DIR/cpa/cpa-token" "$INSTALL_DIR/cpa-token"
+chmod +x "$INSTALL_DIR/cpa-token"
+echo "  ✅ cpa-token"
+
 # 确保 ~/bin 在 PATH 中
 if ! echo "$PATH" | grep -q "$INSTALL_DIR"; then
     if ! grep -q "PATH.*$INSTALL_DIR" ~/.bashrc 2>/dev/null; then
