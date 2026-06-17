@@ -59,7 +59,7 @@ preferred_auth_method = "apikey"
 
 [model_providers.codex]
 name = "OpenAI"
-base_url = "$URL"
+base_url = "$URL/v1"
 experimental_bearer_token = "$API_KEY"
 wire_api = "responses"
 

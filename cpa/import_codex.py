@@ -1,60 +1,22 @@
 #!/usr/bin/env python3
 """
-批量导入 Codex OAuth JSON 文件到 CPA (cli-proxy-api).
+批量导入 Codex OAuth JSON 文件到 CPA auth-dir.
+
+CPA 通过监控 auth-dir 目录自动发现 OAuth 凭证，无需调用管理 API。
+放入目录后 CPA 即刻生效。
 
 用法:
-  python3 cpa-import <json目录>
-  python3 cpa-import /path/to/keys/
-  python3 cpa-import file1.json file2.json
+  cpa-import <json目录>
+  cpa-import /path/to/keys/
+  cpa-import file1.json file2.json
 
 环境变量:
-  CPA_PORT             - CPA 端口, 默认 8317
-  CPA_CONFIG           - CPA config.yaml 路径 (自动检测)
-  CPA_MANAGEMENT_KEY   - CPA 管理密钥 (必填)
+  CPA_AUTH_DIR  - CPA auth 目录, 默认 ~/.cli-proxy-api
+  CPA_CONFIG    - CPA config.yaml 路径 (从中读取 auth-dir)
 """
 
-import json, os, sys, base64, subprocess, time
+import json, os, sys, base64
 from pathlib import Path
-
-CPA_PORT = os.environ.get("CPA_PORT", "8317")
-CPA_MANAGEMENT_KEY = os.environ.get("CPA_MANAGEMENT_KEY", "")
-
-# Auto-detect config.yaml path
-def _find_config():
-    if "CPA_CONFIG" in os.environ:
-        return os.environ["CPA_CONFIG"]
-    search_paths = [
-        "/root/cliproxyapi/config.yaml",
-        "/opt/cliproxyapi/config.yaml",
-        os.path.expanduser("~/cliproxyapi/config.yaml"),
-    ]
-    for p in search_paths:
-        if os.path.isfile(p):
-            return p
-    # Also search /home/*/cliproxyapi/config.yaml
-    for d in Path("/home").glob("*/cliproxyapi/config.yaml"):
-        return str(d)
-    return ""
-
-CPA_CONFIG = _find_config()
-
-# Auto-detect CPA binary path
-def _find_binary():
-    search_paths = [
-        "/root/cliproxyapi/cli-proxy-api",
-        "/opt/cliproxyapi/cli-proxy-api",
-    ]
-    for p in search_paths:
-        if os.path.isfile(p):
-            return p
-    if CPA_CONFIG:
-        d = Path(CPA_CONFIG).parent / "cli-proxy-api"
-        if d.is_file():
-            return str(d)
-    return "cli-proxy-api"
-
-CPA_BINARY = _find_binary()
-API_BASE = f"http://127.0.0.1:{CPA_PORT}"
 
 
 def decode_jwt_payload(token: str) -> dict:
@@ -62,72 +24,76 @@ def decode_jwt_payload(token: str) -> dict:
         payload = token.split(".")[1]
         payload += "=" * (4 - len(payload) % 4)
         return json.loads(base64.urlsafe_b64decode(payload))
-    except: return {}
+    except:
+        return {}
 
 
-def parse_codex_file(filepath: str) -> dict | None:
+def find_auth_dir():
+    """自动检测 CPA auth 目录"""
+    # 优先用环境变量
+    if "CPA_AUTH_DIR" in os.environ:
+        return Path(os.environ["CPA_AUTH_DIR"]).expanduser()
+
+    # 尝试从 config.yaml 读取
+    config_paths = [
+        os.environ.get("CPA_CONFIG", ""),
+        "/root/cliproxyapi/config.yaml",
+        "/opt/cliproxyapi/config.yaml",
+        os.path.expanduser("~/cliproxyapi/config.yaml"),
+    ]
+    for cp in config_paths:
+        if cp and Path(cp).is_file():
+            try:
+                import yaml
+                with open(cp) as f:
+                    cfg = yaml.safe_load(f)
+                ad = cfg.get("auth-dir", "")
+                if ad:
+                    return Path(ad).expanduser()
+            except:
+                pass
+
+    # 默认
+    return Path("~/.cli-proxy-api").expanduser()
+
+
+def parse_codex_file(filepath: str) -> tuple[dict, dict] | None:
+    """解析 Codex JSON 文件，返回 (文件数据, 提取的账号信息)"""
     with open(filepath) as f:
         data = json.load(f)
+
     if data.get("type") != "codex":
         return None
+
     token = data.get("access_token", "")
     if not token:
         return None
+
     jwt = decode_jwt_payload(token)
     auth = jwt.get("https://api.openai.com/auth", {})
     profile = jwt.get("https://api.openai.com/profile", {})
-    return {
+    info = {
         "email": profile.get("email") or data.get("email", "?"),
         "user_id": auth.get("user_id", "?"),
-        "access_token": token,
         "plan": data.get("plan_type", "free"),
         "expired": data.get("expired", "?"),
     }
+    return data, info
 
 
-def api(method: str, path: str, data=None) -> dict:
-    if not CPA_MANAGEMENT_KEY:
-        print("❌ 请设置环境变量 CPA_MANAGEMENT_KEY (CPA 管理密钥)")
-        sys.exit(1)
-    cmd = ["curl", "-s", "-X", method,
-           "-H", f"X-Management-Key: {CPA_MANAGEMENT_KEY}",
-           "-H", "Content-Type: application/json"]
-    if data is not None:
-        tmp = "/tmp/cpa_api.json"
-        with open(tmp, 'w') as f:
-            json.dump(data, f)
-        cmd += ["-d", f"@{tmp}"]
-    cmd.append(f"{API_BASE}{path}")
-    r = subprocess.run(cmd, capture_output=True, text=True)
-    try: return json.loads(r.stdout) if r.stdout else {}
-    except: return {}
-
-
-def get_existing_ids() -> set:
-    resp = api("GET", "/v0/management/codex-api-key")
-    ids = set()
-    for e in resp.get("codex-api-key", []):
-        jwt = decode_jwt_payload(e.get("api-key", ""))
-        uid = jwt.get("https://api.openai.com/auth", {}).get("user_id", "")
-        if uid: ids.add(uid)
-    return ids
-
-
-def ensure_service():
-    r = subprocess.run(["curl", "-s", "-o", "/dev/null", "-w", "%{http_code}",
-                         f"{API_BASE}/"], capture_output=True, text=True)
-    if r.stdout.strip() not in ("200","401","404"):
-        print("启动 CPA 服务...")
-        subprocess.Popen(["nohup", CPA_BINARY,
-                          ">/dev/null", "2>&1"])
-        for _ in range(10):
-            time.sleep(1)
-            r2 = subprocess.run(["curl", "-s", "-o", "/dev/null", "-w", "%{http_code}",
-                                  f"{API_BASE}/"], capture_output=True, text=True)
-            if r2.stdout.strip() in ("200","401","404"):
-                print("  已启动")
-                return
-        print("  ⚠️ 启动失败"); sys.exit(1)
+def scan_existing(auth_dir: Path) -> dict:
+    """扫描 auth-dir 中已有的 Codex 文件，返回 {user_id: filename}"""
+    existing = {}
+    if not auth_dir.is_dir():
+        return existing
+    for f in auth_dir.glob("*.json"):
+        result = parse_codex_file(str(f))
+        if result:
+            _, info = result
+            uid = info["user_id"]
+            if uid and uid != "?":
+                existing[uid] = f.name
+    return existing
 
 
 def main():
@@ -135,6 +101,7 @@ def main():
         print(__doc__)
         sys.exit(1)
 
+    # 收集输入文件
     files = []
     for arg in sys.argv[1:]:
         p = Path(arg)
@@ -144,53 +111,78 @@ def main():
             files.append(p)
 
     if not files:
-        print("未找到 JSON 文件"); sys.exit(1)
+        print("未找到 JSON 文件")
+        sys.exit(1)
 
-    print(f"扫描 {len(files)} 个文件...\n")
+    auth_dir = find_auth_dir()
+    auth_dir.mkdir(parents=True, exist_ok=True)
 
+    print(f"扫描 {len(files)} 个文件...")
+    print(f"目标目录: {auth_dir}")
+    print()
+
+    # 解析所有文件
     accounts = []
     for f in files:
-        a = parse_codex_file(str(f))
-        if a:
-            accounts.append(a)
-            print(f"  ✓ {a['email']} | {a['plan']} | {a['expired']}")
+        result = parse_codex_file(str(f))
+        if result:
+            data, info = result
+            accounts.append((f, data, info))
+            exp = info["expired"]
+            print(f"  ✓ {info['email']}")
+            print(f"    plan={info['plan']}  expired={exp}")
         else:
-            print(f"  ✗ {f.name} (非codex)")
+            print(f"  ✗ {f.name} (非 codex 类型，跳过)")
 
     if not accounts:
-        print("\n无有效 Codex 账号"); return
+        print("\n无有效 Codex 账号")
+        return
 
-    # 去重
-    uniq = {}
-    for a in accounts:
-        if a["user_id"] not in uniq:
-            uniq[a["user_id"]] = a
+    # 去重 (按 user_id)
+    seen = {}
+    for f, data, info in accounts:
+        uid = info["user_id"]
+        if uid not in seen:
+            seen[uid] = (f, data, info)
 
-    print(f"\n解析: {len(accounts)} | 去重: {len(uniq)}")
+    print(f"\n解析: {len(accounts)} | 去重: {len(seen)}")
 
-    ensure_service()
-    existing = get_existing_ids()
-    new = {uid: a for uid, a in uniq.items() if uid not in existing}
-    print(f"已存在: {len(uniq)-len(new)} | 新增: {len(new)}")
+    # 检查已有文件
+    existing = scan_existing(auth_dir)
+    imported, skipped, updated = 0, 0, 0
 
-    if not new:
-        print("无需更新"); return
+    for uid, (src_path, data, info) in seen.items():
+        dest_name = src_path.name
+        dest_path = auth_dir / dest_name
 
-    # 合并
-    all_entries = api("GET", "/v0/management/codex-api-key").get("codex-api-key", [])
-    for uid, a in new.items():
-        all_entries.append({
-            "api-key": a["access_token"],
-            "prefix": "",
-            "disable-cooling": False,
-            "base-url": "https://api.openai.com/v1",
-        })
+        if uid in existing:
+            if existing[uid] == dest_name:
+                print(f"  ⏭ {info['email']} (已存在)")
+                skipped += 1
+                continue
+            else:
+                # user_id 相同但文件名不同 → 覆盖
+                old_path = auth_dir / existing[uid]
+                old_path.unlink(missing_ok=True)
+                print(f"  🔄 {info['email']} (覆盖旧文件 {existing[uid]})")
+                updated += 1
+        else:
+            print(f"  → {info['email']}")
+            imported += 1
 
-    resp = api("PUT", "/v0/management/codex-api-key", all_entries)
-    if resp.get("status") == "ok":
-        print(f"\n✅ 导入成功! 当前共 {len(all_entries)} 个 Codex 账号")
-    else:
-        print(f"\n❌ 失败: {resp}")
+        # 直接复制 JSON 文件到 auth-dir
+        with open(src_path) as f:
+            original = json.load(f)
+        # 添加导入时间戳
+        if "imported_at" not in original:
+            from datetime import datetime, timezone
+            original["imported_at"] = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+        with open(dest_path, 'w') as f:
+            json.dump(original, f, indent=2)
+
+    print()
+    print(f"✅ 导入: {imported} | 更新: {updated} | 跳过: {skipped}")
+    print(f"   CPA 已自动检测并加载，无需重启")
 
 
 if __name__ == "__main__":
