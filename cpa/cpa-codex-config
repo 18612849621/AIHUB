@@ -1,0 +1,100 @@
+#!/bin/bash
+# cpa-codex-config - 生成 Codex CLI TOML 配置，可直接复制粘贴
+# 纯打印到屏幕
+#
+# 环境变量 (可选):
+#   CPA_PORT   - CPA 端口, 默认 8317
+#   CPA_CONFIG - CPA config.yaml 路径
+#   CPA_MODEL   - 模型名, 默认 gpt-5.5
+
+CPA_PORT=${CPA_PORT:-8317}
+
+# 自动检测 CPA 地址
+if [ -n "$CPA_URL" ]; then
+    URL="$CPA_URL"
+else
+    CPA_IP=$(hostname -I | awk '{print $1}')
+    [ -z "$CPA_IP" ] && CPA_IP="127.0.0.1"
+    URL="http://${CPA_IP}:${CPA_PORT}"
+fi
+
+# 自动查找 config.yaml
+if [ -z "$CPA_CONFIG" ]; then
+    for p in /root/cliproxyapi/config.yaml /home/*/cliproxyapi/config.yaml /opt/cliproxyapi/config.yaml ./config.yaml; do
+        [ -f "$p" ] && CPA_CONFIG="$p" && break
+    done
+fi
+
+# 提取 API key
+API_KEY=$(python3 -c "
+import yaml
+with open('$CPA_CONFIG') as f:
+    cfg = yaml.safe_load(f)
+keys = cfg.get('api-keys', [])
+print(keys[0] if keys else '')
+" 2>/dev/null)
+
+if [ -z "$API_KEY" ]; then
+    echo "❌ 未找到 CPA API key"
+    echo "   请设置: export CPA_CONFIG=/path/to/config.yaml"
+    exit 1
+fi
+
+# 默认模型
+MODEL=${CPA_MODEL:-"gpt-5.5"}
+
+echo "============================================"
+echo " Codex CLI 配置"
+echo "============================================"
+echo ""
+echo "# ── 复制以下内容到 ~/.codex/config.toml ──"
+echo ""
+
+cat <<TOML
+model_provider = "codex"
+model = "$MODEL"
+review_model = "$MODEL"
+model_reasoning_effort = "xhigh"
+disable_response_storage = true
+network_access = "enabled"
+windows_wsl_setup_acknowledged = true
+
+[model_providers.codex]
+name = "codex"
+base_url = "$URL"
+wire_api = "responses"
+requires_openai_auth = true
+
+[features]
+goals = true
+TOML
+
+echo ""
+echo "# ── 环境变量 (另外复制) ──"
+echo ""
+echo "export OPENAI_API_KEY='$API_KEY'"
+
+echo ""
+echo "============================================"
+echo " 代理地址: $URL"
+echo " 默认模型: $MODEL (可 export CPA_MODEL=xxx 覆盖)"
+echo ""
+echo " 可用模型列表:"
+echo "============================================"
+echo ""
+
+curl -s --max-time 5 -H "Authorization: Bearer $API_KEY" "$URL/v1/models" 2>/dev/null | \
+  python3 -c "
+import json, sys
+try:
+    data = json.load(sys.stdin)
+    for m in data.get('data', []):
+        mid = m.get('id', '')
+        if 'image' in mid:
+            print(f'  {mid}  (图片)')
+        elif 'codex' in mid:
+            print(f'  {mid}  (codex专用)')
+        else:
+            print(f'  {mid}')
+except: pass
+" 2>/dev/null

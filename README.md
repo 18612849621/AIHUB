@@ -13,6 +13,7 @@ bash install.sh
 ```bash
 cpa-status              # 查看 CPA 状态 (账号/模型/配置)
 cpa-import <dir>        # 批量导入 Codex JSON key 文件
+cpa-codex-config        # 生成 Codex CLI 配置 (可直接复制粘贴)
 ```
 
 ### cpa-import 用法

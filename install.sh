@@ -23,6 +23,11 @@ cp "$REPO_DIR/cpa/import_codex.py" "$INSTALL_DIR/cpa-import"
 chmod +x "$INSTALL_DIR/cpa-import"
 echo "  ✅ cpa-import"
 
+# 安装 cpa-codex-config
+cp "$REPO_DIR/cpa/cpa-codex-config" "$INSTALL_DIR/cpa-codex-config"
+chmod +x "$INSTALL_DIR/cpa-codex-config"
+echo "  ✅ cpa-codex-config"
+
 # 确保 ~/bin 在 PATH 中
 if ! echo "$PATH" | grep -q "$INSTALL_DIR"; then
     if ! grep -q "PATH.*$INSTALL_DIR" ~/.bashrc 2>/dev/null; then
