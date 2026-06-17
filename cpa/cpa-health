@@ -6,6 +6,7 @@
 #
 # 用法:
 #   cpa-health                  # 健康检查
+#   cpa-health --watch [N]    # 实时监测, 每 N 秒刷新 (默认10秒)
 #   cpa-health --clean          # 清理问题账号 (需确认)
 #   cpa-health --clean --force  # 清理不确认
 
@@ -14,6 +15,44 @@ set -e
 CPA_PORT=${CPA_PORT:-8317}
 AUTH_DIR="${CPA_AUTH_DIR:-$HOME/.cli-proxy-api}"
 [ -d "$AUTH_DIR" ] || AUTH_DIR="/root/.cli-proxy-api"
+
+# ── 解析参数 ──
+CLEAN_MODE=false; FORCE=false; WATCH=0
+for arg in "$@"; do
+    case "$arg" in
+        --clean) CLEAN_MODE=true ;;
+        --force) FORCE=true ;;
+        --watch) WATCH=10 ;;
+        --watch=*) WATCH="${arg#*=}" ;;
+        --help|-h)
+            echo "用法: cpa-health [--watch [N]] [--clean] [--force]"
+            echo "  --watch [N]  实时监测, 每 N 秒刷新 (默认10秒)"
+            echo "  --clean      清理问题账号"
+            echo "  --force      跳过确认"
+            exit 0 ;;
+    esac
+done
+
+# ── 实时模式: 循环执行自身 ──
+if [ "$WATCH" -gt 0 ]; then
+    SELF="$(readlink -f "$0")"
+    while true; do
+        clear 2>/dev/null || printf '\033[2J\033[H'
+        bash "$SELF" --clean="$CLEAN_MODE" --force="$FORCE" 2>/dev/null || true
+        echo ""
+        echo "🔄 每 ${WATCH}s 刷新 | Ctrl-C 退出 | $(date '+%H:%M:%S')"
+        sleep "$WATCH"
+    done
+    exit 0
+fi
+
+# 内部参数 (watch 模式传递)
+for arg in "$@"; do
+    case "$arg" in
+        --clean=true) CLEAN_MODE=true ;;
+        --force=true) FORCE=true ;;
+    esac
+done
 
 # ── 自动找管理密钥: env > .mgmt_key > config.yaml明文 ──
 find_mgmt_key() {
@@ -33,15 +72,6 @@ if not sk.startswith('\$2a\$'): print(sk)
 }
 
 MGMT_KEY="${CPA_MANAGEMENT_KEY:-$(find_mgmt_key)}"
-
-CLEAN_MODE=false; FORCE=false
-for arg in "$@"; do
-    case "$arg" in
-        --clean) CLEAN_MODE=true ;;
-        --force) FORCE=true ;;
-        --help|-h) echo "用法: cpa-health [--clean] [--force]"; exit 0 ;;
-    esac
-done
 
 echo "============================================"
 echo " CPA Codex 账号健康检查"
