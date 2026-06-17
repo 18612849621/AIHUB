@@ -3,21 +3,57 @@
 批量导入 Codex OAuth JSON 文件到 CPA (cli-proxy-api).
 
 用法:
-  python3 import_codex.py <json目录>
-  python3 import_codex.py /path/to/keys/
-  python3 import_codex.py file1.json file2.json
+  python3 cpa-import <json目录>
+  python3 cpa-import /path/to/keys/
+  python3 cpa-import file1.json file2.json
 
 环境变量:
-  CPA_PORT    - CPA 端口, 默认 8317
-  CPA_CONFIG  - CPA config.yaml 路径
+  CPA_PORT             - CPA 端口, 默认 8317
+  CPA_CONFIG           - CPA config.yaml 路径 (自动检测)
+  CPA_MANAGEMENT_KEY   - CPA 管理密钥 (必填)
 """
 
 import json, os, sys, base64, subprocess, time
 from pathlib import Path
 
 CPA_PORT = os.environ.get("CPA_PORT", "8317")
-CPA_CONFIG = os.environ.get("CPA_CONFIG", "/home/jom/cliproxyapi/config.yaml")
-MANAGEMENT_KEY = "admin123"
+CPA_MANAGEMENT_KEY = os.environ.get("CPA_MANAGEMENT_KEY", "")
+
+# Auto-detect config.yaml path
+def _find_config():
+    if "CPA_CONFIG" in os.environ:
+        return os.environ["CPA_CONFIG"]
+    search_paths = [
+        "/root/cliproxyapi/config.yaml",
+        "/opt/cliproxyapi/config.yaml",
+        os.path.expanduser("~/cliproxyapi/config.yaml"),
+    ]
+    for p in search_paths:
+        if os.path.isfile(p):
+            return p
+    # Also search /home/*/cliproxyapi/config.yaml
+    for d in Path("/home").glob("*/cliproxyapi/config.yaml"):
+        return str(d)
+    return ""
+
+CPA_CONFIG = _find_config()
+
+# Auto-detect CPA binary path
+def _find_binary():
+    search_paths = [
+        "/root/cliproxyapi/cli-proxy-api",
+        "/opt/cliproxyapi/cli-proxy-api",
+    ]
+    for p in search_paths:
+        if os.path.isfile(p):
+            return p
+    if CPA_CONFIG:
+        d = Path(CPA_CONFIG).parent / "cli-proxy-api"
+        if d.is_file():
+            return str(d)
+    return "cli-proxy-api"
+
+CPA_BINARY = _find_binary()
 API_BASE = f"http://127.0.0.1:{CPA_PORT}"
 
 
@@ -50,8 +86,11 @@ def parse_codex_file(filepath: str) -> dict | None:
 
 
 def api(method: str, path: str, data=None) -> dict:
+    if not CPA_MANAGEMENT_KEY:
+        print("❌ 请设置环境变量 CPA_MANAGEMENT_KEY (CPA 管理密钥)")
+        sys.exit(1)
     cmd = ["curl", "-s", "-X", method,
-           "-H", f"X-Management-Key: {MANAGEMENT_KEY}",
+           "-H", f"X-Management-Key: {CPA_MANAGEMENT_KEY}",
            "-H", "Content-Type: application/json"]
     if data is not None:
         tmp = "/tmp/cpa_api.json"
@@ -79,7 +118,7 @@ def ensure_service():
                          f"{API_BASE}/"], capture_output=True, text=True)
     if r.stdout.strip() not in ("200","401","404"):
         print("启动 CPA 服务...")
-        subprocess.Popen(["nohup", "/home/jom/cliproxyapi/cli-proxy-api",
+        subprocess.Popen(["nohup", CPA_BINARY,
                           ">/dev/null", "2>&1"])
         for _ in range(10):
             time.sleep(1)

@@ -14,7 +14,7 @@ fi
 
 # 自动查找 config.yaml
 if [ -z "$CPA_CONFIG" ]; then
-    for p in /home/*/cliproxyapi/config.yaml /opt/cliproxyapi/config.yaml ./config.yaml; do
+    for p in /root/cliproxyapi/config.yaml /home/*/cliproxyapi/config.yaml /opt/cliproxyapi/config.yaml ./config.yaml; do
         [ -f "$p" ] && CPA_CONFIG="$p" && break
     done
 fi
