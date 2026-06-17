@@ -1,0 +1,92 @@
+#!/bin/bash
+# cpa-status - 查看 CPA 代理状态
+# 环境变量: CPA_URL (代理地址), CPA_CONFIG (config.yaml路径)
+
+CPA_PORT=${CPA_PORT:-8317}
+
+# 自动检测 CPA 地址
+if [ -n "$CPA_URL" ]; then
+    URL="$CPA_URL"
+else
+    CPA_IP=$(hostname -I | awk '{print $1}')
+    URL="http://${CPA_IP}:${CPA_PORT}"
+fi
+
+# 自动查找 config.yaml
+if [ -z "$CPA_CONFIG" ]; then
+    for p in /home/*/cliproxyapi/config.yaml /opt/cliproxyapi/config.yaml ./config.yaml; do
+        [ -f "$p" ] && CPA_CONFIG="$p" && break
+    done
+fi
+
+API_KEY=$(python3 -c "
+import yaml
+with open('$CPA_CONFIG') as f:
+    cfg = yaml.safe_load(f)
+keys = cfg.get('api-keys', [])
+print(keys[0] if keys else '')
+" 2>/dev/null)
+
+if [ -z "$API_KEY" ]; then
+    echo "❌ 未找到 CPA 配置"
+    echo "   请设置: export CPA_CONFIG=/path/to/config.yaml"
+    exit 1
+fi
+
+echo "============================================"
+echo " CPA 代理状态"
+echo "============================================"
+echo ""
+echo "📍 地址: $URL"
+echo "🔑 入口 key: ${API_KEY:0:25}..."
+echo ""
+
+python3 -c "
+import yaml, json, base64
+
+with open('$CPA_CONFIG') as f:
+    cfg = yaml.safe_load(f)
+
+def uid_of(token):
+    try:
+        p = token.split('.')[1]
+        p += '=' * (4 - len(p) % 4)
+        j = json.loads(base64.urlsafe_b64decode(p))
+        return j.get('https://api.openai.com/auth',{}).get('user_id','?')
+    except: return '?'
+
+api = len(cfg.get('api-keys', []))
+codex = cfg.get('codex-api-key', []) or []
+claude = cfg.get('claude-api-key', []) or []
+gemini = cfg.get('gemini-api-key', []) or []
+openai = cfg.get('openai-compatibility', []) or []
+vertex = cfg.get('vertex-api-key', []) or []
+
+print('账号统计:')
+print(f'  入口 key:     {api} 个')
+print(f'  Codex:        {len(codex)} 个')
+print(f'  Claude:       {len(claude)} 个')
+print(f'  Gemini:       {len(gemini)} 个')
+print(f'  OpenAI兼容:   {len(openai)} 个')
+print(f'  Vertex:       {len(vertex)} 个')
+if codex:
+    print()
+    for i, c in enumerate(codex):
+        print(f'  Codex[{i+1}] {uid_of(c.get(\"api-key\",\"\"))}')
+"
+
+echo ""
+echo "----------------------------------------"
+echo " 可用模型"
+echo "----------------------------------------"
+curl -s --max-time 3 -H "Authorization: Bearer $API_KEY" "$URL/v1/models" 2>/dev/null | \
+  python3 -c "import json,sys;d=json.load(sys.stdin);[print(f'  {m[\"id\"]}') for m in d.get('data',[])]" 2>/dev/null || \
+  echo "  ⚠️ 无法连接"
+
+echo ""
+echo "----------------------------------------"
+echo " 外部使用配置"
+echo "----------------------------------------"
+echo ""
+echo "export OPENAI_API_KEY='$API_KEY'"
+echo "export CODEX_BASE_URL='$URL'"
