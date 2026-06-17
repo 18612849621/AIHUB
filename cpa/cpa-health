@@ -161,39 +161,72 @@ for f in files:
     live = api_status.get(email, {})
     if live:
         recent = live.get("recent_requests", [])
-        # 最近 30 分钟的请求
-        recent_reqs = []
-        for r in recent[-3:]:  # 最近 3 个时间槽 (30min)
-            recent_reqs.append((r.get("success", 0), r.get("failed", 0)))
-        total_s = sum(s for s, f in recent_reqs)
-        total_f = sum(f for s, f in recent_reqs)
+        # 全部时间槽
+        all_slots = [(r.get("success", 0), r.get("failed", 0)) for r in recent]
+        total_s = sum(s for s, f in all_slots)
+        total_f = sum(f for s, f in all_slots)
         total_r = total_s + total_f
 
-        # 封号检测: 最近有请求但全失败 (可能是 TOS / banned)
-        if total_r >= 3 and total_s == 0 and total_f >= 3:
-            issues.append(f"疑似封号: 最近{total_r}次全部失败")
-            severity = "banned"
+        # 最近 30 分钟
+        recent_slots = all_slots[-3:]
+        r30_s = sum(s for s, f in recent_slots)
+        r30_f = sum(f for s, f in recent_slots)
 
-        # 高失败率
-        elif total_r >= 5 and total_f > 0:
-            fail_rate = total_f / total_r
-            if fail_rate >= 0.5:
-                issues.append(f"高失败率: {total_f}/{total_r}")
-                if severity == "ok":
+        # 最近 60 分钟
+        recent_slots_60 = all_slots[-6:]
+        r60_s = sum(s for s, f in recent_slots_60)
+        r60_f = sum(f for s, f in recent_slots_60)
+
+        # 最近有过请求才分析
+        has_traffic = total_r > 0 or live.get("unavailable") or live.get("disabled")
+
+        if has_traffic:
+            # ── CPA 标记不可用 ──
+            if live.get("unavailable"):
+                # 被 CPA 冷却了，看原因
+                if r60_s > 0:
+                    issues.append("CPA冷却中(曾可用)")
+                    if severity == "ok": severity = "warn"
+                elif r60_f > 0:
+                    issues.append("额度耗尽/冷却中")
                     severity = "warn"
+                else:
+                    issues.append("CPA标记不可用")
+                    if severity == "ok": severity = "warn"
 
-        # 额度耗尽
-        if total_r >= 2 and total_s == 0 and total_f >= 1:
-            issues.append("可能额度耗尽")
+            if live.get("disabled"):
+                issues.append("已禁用")
+                severity = "bad"
 
-        # CPA 内部状态
-        if live.get("unavailable"):
-            issues.append("CPA标记不可用")
-            if severity == "ok":
-                severity = "warn"
-        if live.get("disabled"):
-            issues.append("已禁用")
-            severity = "bad"
+            # ── 封号检测 ──
+            # 特征: 有失败但从未成功过 (长期全失败)
+            if total_s == 0 and total_f >= 2:
+                if r60_f >= 2:
+                    issues.append(f"🚫 疑似封号: 累计{total_f}次全失败")
+                    severity = "banned"
+                elif total_f >= 3:
+                    issues.append(f"🚫 疑似封号: 累计{total_f}次全失败")
+                    severity = "banned"
+
+            # ── 额度耗尽检测 ──
+            # 特征: 曾成功过但现在连续失败 (CPA round-robin 下可能只有1-2次失败就被跳过)
+            elif total_s > 0 and r30_s == 0 and r30_f >= 1:
+                issues.append("额度耗尽: 最近无成功")
+                if severity == "ok": severity = "warn"
+            elif total_s > 0 and r60_s == 0 and r60_f >= 2:
+                issues.append("额度耗尽: 最近全部失败")
+                if severity == "ok": severity = "warn"
+
+            # ── 比率检查 (累计) ──
+            if total_r >= 5 and total_f > 0 and severity == "ok":
+                fail_rate = total_f / total_r
+                if fail_rate >= 0.3:
+                    issues.append(f"失败率偏高: {total_f}/{total_r}")
+                    if severity == "ok": severity = "warn"
+                elif fail_rate >= 0.6:
+                    issues.append(f"高失败率: {total_f}/{total_r}")
+                    severity = "bad"
+
         status_msg = live.get("status_message", "")
         if status_msg:
             issues.append(f"状态: {status_msg}")
