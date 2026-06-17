@@ -11,11 +11,34 @@ CPA_PORT=${CPA_PORT:-8317}
 
 # 自动检测 CPA 地址
 if [ -n "$CPA_URL" ]; then
-    URL="$CPA_URL"
+    PUBLIC_URL="$CPA_URL"
 else
-    CPA_IP=$(hostname -I | awk '{print $1}')
-    [ -z "$CPA_IP" ] && CPA_IP="127.0.0.1"
-    URL="http://${CPA_IP}:${CPA_PORT}"
+    # 公网 IP
+    PUBLIC_IP=$(curl -s --max-time 3 https://ifconfig.me 2>/dev/null || \
+                curl -s --max-time 3 https://api.ipify.org 2>/dev/null || \
+                curl -s --max-time 3 http://ipinfo.io/ip 2>/dev/null)
+    # 内网 IP
+    LAN_IP=$(hostname -I | awk '{print $1}')
+    [ -z "$LAN_IP" ] && LAN_IP="127.0.0.1"
+
+    if [ -n "$PUBLIC_IP" ]; then
+        PUBLIC_URL="http://${PUBLIC_IP}:${CPA_PORT}"
+    else
+        PUBLIC_URL="http://${LAN_IP}:${CPA_PORT}"
+    fi
+fi
+
+# 用于实际请求的 URL (本地请求走内网更快，但配置里展示公网)
+if [ -n "$PUBLIC_IP" ]; then
+    LAN_URL="http://${LAN_IP}:${CPA_PORT}"
+    # 本地探测用内网，速度快
+    PROBE_URL="$LAN_URL"
+    # 配置展示用公网
+    CONFIG_URL="$PUBLIC_URL"
+else
+    PROBE_URL="$PUBLIC_URL"
+    CONFIG_URL="$PUBLIC_URL"
+    LAN_URL=""
 fi
 
 # 自动查找 config.yaml
@@ -50,6 +73,10 @@ echo ""
 echo "# ── 复制以下内容到 ~/.codex/config.toml ──"
 echo ""
 
+# 生成内网注释行
+LAN_COMMENT=""
+[ -n "$LAN_URL" ] && LAN_COMMENT="# base_url = \"$LAN_URL/v1\"  (内网)"
+
 cat <<TOML
 model_provider = "codex"
 model = "$MODEL"
@@ -59,7 +86,8 @@ preferred_auth_method = "apikey"
 
 [model_providers.codex]
 name = "OpenAI"
-base_url = "$URL/v1"
+base_url = "$CONFIG_URL/v1"
+$LAN_COMMENT
 experimental_bearer_token = "$API_KEY"
 wire_api = "responses"
 
@@ -92,14 +120,15 @@ echo "export OPENAI_API_KEY='$API_KEY'"
 
 echo ""
 echo "============================================"
-echo " 代理地址: $URL"
+echo " 公网: $CONFIG_URL"
+[ -n "$LAN_URL" ] && echo " 内网: $LAN_URL"
 echo " 默认模型: $MODEL (可 export CPA_MODEL=xxx 覆盖)"
 echo ""
 echo " 可用模型列表:"
 echo "============================================"
 echo ""
 
-curl -s --max-time 5 -H "Authorization: Bearer $API_KEY" "$URL/v1/models" 2>/dev/null | \
+curl -s --max-time 5 -H "Authorization: Bearer $API_KEY" "$PROBE_URL/v1/models" 2>/dev/null | \
   python3 -c "
 import json, sys
 try:
