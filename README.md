@@ -17,6 +17,17 @@ cpa-codex-config        # 生成 Codex CLI 配置 (可直接复制粘贴)
 cpa-health              # 检查账号健康状态 / 清理过期账号
 ```
 
+### cpa-health 用法
+
+```bash
+cpa-health                  # 检查账号健康 (JWT过期/额度/封号)
+cpa-health --clean          # 清理问题账号
+cpa-health --clean --force  # 跳过确认
+
+# 如需连接 CPA 实时状态 (推荐):
+export CPA_MANAGEMENT_KEY="你的管理密钥"
+```
+
 ### cpa-import 用法
 
 ```bash
@@ -38,6 +49,7 @@ cpa-import file1.json file2.json
 | `CPA_CONFIG` | config.yaml 路径 | 自动查找 |
 | `CPA_MODEL` | cpa-codex-config 默认模型 | `gpt-5.5` |
 | `CPA_AUTH_DIR` | auth 目录 | `~/.cli-proxy-api` |
+| `CPA_MANAGEMENT_KEY` | 管理密钥 (cpa-health 连线用) | 自动检测 |
 
 ## 配置路径自动检测
 
