@@ -1,8 +1,9 @@
 #!/bin/bash
-# cpa-config - Codex CLI 配置
+# cpa-config - 一键输出 Codex + Claude Code 配置
 # 纯打印到屏幕, 直接复制粘贴
 
 CPA_PORT=${CPA_PORT:-8317}
+MAPPER_PORT=8080
 
 # ── 公网/内网 IP ──
 PUBLIC_IP=$(curl -s --max-time 3 https://ifconfig.me 2>/dev/null || \
@@ -12,11 +13,13 @@ LAN_IP=$(hostname -I | awk '{print $1}')
 [ -z "$LAN_IP" ] && LAN_IP="127.0.0.1"
 
 if [ -n "$PUBLIC_IP" ]; then
-    CONFIG_URL="http://${PUBLIC_IP}:${CPA_PORT}"
-    LAN_URL="http://${LAN_IP}:${CPA_PORT}"
+    CPA_URL="http://${PUBLIC_IP}:${CPA_PORT}"
+    MAPPER_URL="http://${PUBLIC_IP}:${MAPPER_PORT}"
+    LAN_CPA="http://${LAN_IP}:${CPA_PORT}"
 else
-    CONFIG_URL="http://${LAN_IP}:${CPA_PORT}"
-    LAN_URL=""
+    CPA_URL="http://${LAN_IP}:${CPA_PORT}"
+    MAPPER_URL="http://${LAN_IP}:${MAPPER_PORT}"
+    LAN_CPA=""
 fi
 
 # ── API Key ──
@@ -35,7 +38,12 @@ print(keys[0] if keys else '')
 
 MODEL=${CPA_MODEL:-"gpt-5.5"}
 
-echo "# ── 复制以下内容到 ~/.codex/config.toml ──"
+# ═══════════════════════════════════
+# Codex CLI
+# ═══════════════════════════════════
+echo "============================================"
+echo " Codex CLI  →  ~/.codex/config.toml"
+echo "============================================"
 echo ""
 
 cat <<TOML
@@ -47,8 +55,7 @@ preferred_auth_method = "apikey"
 
 [model_providers.codex]
 name = "OpenAI"
-base_url = "$CONFIG_URL/v1"
-# base_url = "${LAN_URL}/v1"  (内网)
+base_url = "$CPA_URL/v1"
 experimental_bearer_token = "$API_KEY"
 wire_api = "responses"
 
@@ -74,14 +81,31 @@ enabled = false
 "$MODEL" = 4
 TOML
 
+# ═══════════════════════════════════
+# Claude Code
+# ═══════════════════════════════════
 echo ""
-echo "# ── 或直接 export ──"
+echo "============================================"
+echo " Claude Code  →  终端环境变量"
+echo "  claude-* 自动映射 → $MODEL"
+echo "============================================"
 echo ""
-echo "export OPENAI_API_KEY='$API_KEY'"
+
+cat <<ENV
+export ANTHROPIC_BASE_URL='${MAPPER_URL}/v1'
+export ANTHROPIC_API_KEY='$API_KEY'
+export ANTHROPIC_MODEL=claude-sonnet-4-6
+export ANTHROPIC_DEFAULT_OPUS_MODEL=claude-opus-4-8
+export ANTHROPIC_DEFAULT_SONNET_MODEL=claude-sonnet-4-6
+export ANTHROPIC_DEFAULT_HAIKU_MODEL=claude-haiku-4-5
+export CLAUDE_CODE_SUBAGENT_MODEL=claude-sonnet-4-6
+export CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC=1
+export CLAUDE_CODE_EFFORT_LEVEL=max
+ENV
 
 echo ""
 echo "============================================"
-echo " 公网: $CONFIG_URL"
-[ -n "$LAN_URL" ] && echo " 内网: $LAN_URL"
+echo " 服务:   CPA → $CPA_URL"
+echo " 映射代理 → $MAPPER_URL  (claude-* → $MODEL)"
 echo " 默认模型: $MODEL (export CPA_MODEL=xxx 覆盖)"
 echo "============================================"
