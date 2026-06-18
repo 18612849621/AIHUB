@@ -1,5 +1,5 @@
 #!/bin/bash
-# cpa-config - 一键输出 Codex + Claude Code 配置
+# cpa-config - Codex CLI 配置
 # 纯打印到屏幕, 直接复制粘贴
 
 CPA_PORT=${CPA_PORT:-8317}
@@ -20,11 +20,9 @@ else
 fi
 
 # ── API Key ──
-if [ -z "$CPA_CONFIG" ]; then
-    for p in /root/cliproxyapi/config.yaml /home/*/cliproxyapi/config.yaml /opt/cliproxyapi/config.yaml ./config.yaml; do
-        [ -f "$p" ] && CPA_CONFIG="$p" && break
-    done
-fi
+for p in /root/cliproxyapi/config.yaml /home/*/cliproxyapi/config.yaml /opt/cliproxyapi/config.yaml ./config.yaml; do
+    [ -f "$p" ] && CPA_CONFIG="$p" && break
+done
 
 API_KEY=$(python3 -c "
 import yaml
@@ -37,12 +35,7 @@ print(keys[0] if keys else '')
 
 MODEL=${CPA_MODEL:-"gpt-5.5"}
 
-LAN_COMMENT=""
-[ -n "$LAN_URL" ] && LAN_COMMENT="# export ANTHROPIC_BASE_URL='${LAN_URL}/v1' (内网)"
-
-echo "============================================"
-echo " Codex CLI  →  ~/.codex/config.toml"
-echo "============================================"
+echo "# ── 复制以下内容到 ~/.codex/config.toml ──"
 echo ""
 
 cat <<TOML
@@ -82,25 +75,9 @@ enabled = false
 TOML
 
 echo ""
-echo "============================================"
-echo " Claude Code  →  终端环境变量"
-echo "============================================"
+echo "# ── 或直接 export ──"
 echo ""
-
-cat <<ENV
-export ANTHROPIC_BASE_URL='${CONFIG_URL}/v1'
-$LAN_COMMENT
-export ANTHROPIC_API_KEY='$API_KEY'
-export CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC=1
-export ANTHROPIC_MODEL=$MODEL
-export ANTHROPIC_DEFAULT_OPUS_MODEL=$MODEL
-export ANTHROPIC_DEFAULT_SONNET_MODEL=$MODEL
-export ANTHROPIC_DEFAULT_HAIKU_MODEL=$MODEL
-export CLAUDE_CODE_SUBAGENT_MODEL=$MODEL
-export CLAUDE_CODE_EFFORT_LEVEL=max
-export CLAUDE_CODE_ATTRIBUTION_HEADER=0
-export IS_SANDBOX=1
-ENV
+echo "export OPENAI_API_KEY='$API_KEY'"
 
 echo ""
 echo "============================================"
