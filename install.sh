@@ -13,36 +13,22 @@ echo "安装位置: $INSTALL_DIR"
 
 mkdir -p "$INSTALL_DIR"
 
-# 安装 cpa-status
 cp "$REPO_DIR/cpa/cpa-status" "$INSTALL_DIR/cpa-status"
 chmod +x "$INSTALL_DIR/cpa-status"
 echo "  ✅ cpa-status"
 
-# 安装 import_codex.py
 cp "$REPO_DIR/cpa/import_codex.py" "$INSTALL_DIR/cpa-import"
 chmod +x "$INSTALL_DIR/cpa-import"
 echo "  ✅ cpa-import"
 
-# 安装 cpa-codex-config
-cp "$REPO_DIR/cpa/cpa-codex-config" "$INSTALL_DIR/cpa-codex-config"
-chmod +x "$INSTALL_DIR/cpa-codex-config"
-echo "  ✅ cpa-codex-config"
-
-# 安装 cpa-health
-cp "$REPO_DIR/cpa/cpa-health" "$INSTALL_DIR/cpa-health"
-
-# 安装 cpa-claude-config
-cp "$REPO_DIR/cpa/cpa-claude-config" "$INSTALL_DIR/cpa-claude-config"
 cp "$REPO_DIR/cpa/cpa-config" "$INSTALL_DIR/cpa-config"
 chmod +x "$INSTALL_DIR/cpa-config"
 echo "  ✅ cpa-config"
-chmod +x "$INSTALL_DIR/cpa-claude-config"
-echo "  ✅ cpa-claude-config"
+
+cp "$REPO_DIR/cpa/cpa-health" "$INSTALL_DIR/cpa-health"
 chmod +x "$INSTALL_DIR/cpa-health"
 echo "  ✅ cpa-health"
 
-
-# 确保 ~/bin 在 PATH 中
 if ! echo "$PATH" | grep -q "$INSTALL_DIR"; then
     if ! grep -q "PATH.*$INSTALL_DIR" ~/.bashrc 2>/dev/null; then
         echo 'export PATH="$HOME/bin:$PATH"' >> ~/.bashrc
@@ -56,8 +42,10 @@ echo " 安装完成!"
 echo "========================================"
 echo ""
 echo "使用方法:"
-echo "  cpa-status    查看 CPA 代理状态"
-echo "  cpa-import <dir>  批量导入 Codex key"
+echo "  cpa-status           查看 CPA 代理状态"
+echo "  cpa-import <dir|zip> 批量导入 Codex key"
+echo "  cpa-config            生成 Codex + Claude Code 配置"
+echo "  cpa-health            账号健康检查"
 echo ""
 echo "新终端直接可用, 当前终端请先执行:"
 echo "  export PATH=\"\$HOME/bin:\$PATH\""
