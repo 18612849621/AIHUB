@@ -6,9 +6,9 @@ CPA 通过监控 auth-dir 目录自动发现 OAuth 凭证，无需调用管理 A
 放入目录后 CPA 即刻生效。
 
 用法:
-  cpa-import <json目录|zip文件>
+  cpa-import <json目录|zip文件> [--cleanup]
   cpa-import /path/to/keys/
-  cpa-import keys.zip
+  cpa-import keys.zip --cleanup     # 导入后自动删除源文件
   cpa-import file1.json file2.json keys.zip
 
 环境变量:
@@ -142,11 +142,18 @@ def collect_files(args: list[str]) -> tuple[list[Path], list[Path]]:
 
 
 def main():
-    if len(sys.argv) < 2:
+    # 解析 --cleanup 参数
+    args = sys.argv[1:]
+    cleanup = False
+    if "--cleanup" in args:
+        cleanup = True
+        args = [a for a in args if a != "--cleanup"]
+
+    if len(args) < 1:
         print(__doc__)
         sys.exit(1)
 
-    files, tmpdirs = collect_files(sys.argv[1:])
+    files, tmpdirs = collect_files(args)
 
     if not files:
         print("未找到 JSON 文件")
@@ -227,6 +234,21 @@ def main():
 
     # 清理临时文件
     _cleanup(tmpdirs)
+
+    # --cleanup: 删除源文件
+    if cleanup:
+        deleted = []
+        for a in args:
+            p = Path(a)
+            if p.is_file():
+                p.unlink()
+                deleted.append(p.name)
+            elif p.is_dir() and p.name == "new_keys":
+                # 目录也删 (new_keys 这类临时目录)
+                shutil.rmtree(p, ignore_errors=True)
+                deleted.append(f"{p.name}/")
+        if deleted:
+            print(f"   🗑 已清理: {', '.join(deleted)}")
 
 
 def _cleanup(tmpdirs: list[Path]):

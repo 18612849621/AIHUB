@@ -1,20 +1,15 @@
 # AIHUB - CPA Agent Management
 
-## Import Accounts Skill
+## Import Accounts
 
 When user provides a `.zip` or `.json` file with Codex OAuth credentials:
 
 ```bash
 export PATH="$HOME/bin:$PATH"
-cpa-import <file_or_directory>
+cpa-import <file> --cleanup     # Import + auto-delete source files
 ```
 
-Supports:
-- `.zip` files (auto-extract)
-- `.json` files
-- Directories of JSON files
-
-CPA auto-detects via file watcher — no restart needed.
+After import, always clean up source files (they're no longer needed).
 
 ## Check Health
 
@@ -23,12 +18,6 @@ cpa-health              # One-shot check
 cpa-health --watch 10   # Live dashboard
 cpa-health --clean      # Remove expired/banned accounts
 ```
-
-## Environment
-
-| Var | Purpose | Default |
-|-----|---------|---------|
-| `CPA_MANAGEMENT_KEY` | Management API key | Auto-detected from `~/.cli-proxy-api/.mgmt_key` |
 
 ## Paths
 
