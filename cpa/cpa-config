@@ -1,0 +1,7 @@
+#!/bin/bash
+# cpa-config - 一键输出 Codex + Claude Code 配置
+
+DIR="$(cd "$(dirname "$0")" && pwd)"
+bash "$DIR/cpa-codex-config"
+echo ""
+bash "$DIR/cpa-claude-config"

@@ -33,6 +33,9 @@ cp "$REPO_DIR/cpa/cpa-health" "$INSTALL_DIR/cpa-health"
 
 # 安装 cpa-claude-config
 cp "$REPO_DIR/cpa/cpa-claude-config" "$INSTALL_DIR/cpa-claude-config"
+cp "$REPO_DIR/cpa/cpa-config" "$INSTALL_DIR/cpa-config"
+chmod +x "$INSTALL_DIR/cpa-config"
+echo "  ✅ cpa-config"
 chmod +x "$INSTALL_DIR/cpa-claude-config"
 echo "  ✅ cpa-claude-config"
 chmod +x "$INSTALL_DIR/cpa-health"
