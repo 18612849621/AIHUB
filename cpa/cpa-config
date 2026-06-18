@@ -89,7 +89,6 @@ echo "============================================"
 echo ""
 
 cat <<ENV
-export ANTHROPIC_AUTH_TOKEN='$API_KEY'
 export ANTHROPIC_BASE_URL='${CONFIG_URL}/v1'
 $LAN_COMMENT
 export ANTHROPIC_API_KEY='$API_KEY'
