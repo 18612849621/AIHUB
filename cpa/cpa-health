@@ -1,306 +1,533 @@
-#!/bin/bash
-# cpa-health - Codex 账号健康检查 / 清理
-#
-# 检测: 过期 / 额度耗尽 / 疑似封号 / 高失败率
-# 用量: 时间线柱状图 + 配额百分比估算
-#
-# 用法:
-#   cpa-health                  # 健康检查
-#   cpa-health --watch [N]    # 实时监测, 每 N 秒刷新 (默认10秒)
-#   cpa-health --clean          # 清理问题账号 (需确认)
-#   cpa-health --clean --force  # 清理不确认
+#!/usr/bin/env python3
+"""
+cpa-health — CPA Codex 账号健康检查 / 清理
 
-set -e
+两步检测法 (避免浪费有效账号的额度):
+  1. 先从 CPA 管理 API 获取近期全部失败的账号 (success=0, failed>0)
+  2. 只对失败账号直连 OpenAI 测试, 获取真实 HTTP 状态码
+  3. 401 → token 失效, 可清理;  403 → 额度用光, 保留
 
-CPA_PORT=${CPA_PORT:-8317}
-AUTH_DIR="${CPA_AUTH_DIR:-$HOME/.cli-proxy-api}"
-[ -d "$AUTH_DIR" ] || AUTH_DIR="/root/.cli-proxy-api"
+用法:
+  cpa-health                 # 快速检查 (CPA 管理 API)
+  cpa-health --test          # 两步检测: 先找失败号, 再测状态码
+  cpa-health --test --clean  # 检测并清理 401 死号 (需确认)
+  cpa-health --test -f --clean # 不确认直接删
+  cpa-health --watch [N]     # 实时监测 (默认10秒)
+"""
 
-# ── 解析参数 ──
-CLEAN_MODE=false; FORCE=false; WATCH=0
-for arg in "$@"; do
-    case "$arg" in
-        --clean) CLEAN_MODE=true ;;
-        --force) FORCE=true ;;
-        --watch) WATCH=10 ;;
-        --watch=*) WATCH="${arg#*=}" ;;
-        --help|-h)
-            echo "用法: cpa-health [--watch [N]] [--clean] [--force]"
-            echo "  --watch [N]  实时监测, 每 N 秒刷新 (默认10秒)"
-            echo "  --clean      清理问题账号"
-            echo "  --force      跳过确认"
-            exit 0 ;;
-    esac
-done
-
-# ── 实时模式: 循环执行自身 ──
-if [ "$WATCH" -gt 0 ]; then
-    SELF="$(readlink -f "$0")"
-    while true; do
-        clear 2>/dev/null || printf '\033[2J\033[H'
-        bash "$SELF" --clean="$CLEAN_MODE" --force="$FORCE" 2>/dev/null || true
-        echo ""
-        echo "🔄 每 ${WATCH}s 刷新 | Ctrl-C 退出 | $(date '+%H:%M:%S')"
-        sleep "$WATCH"
-    done
-    exit 0
-fi
-
-# 内部参数 (watch 模式传递)
-for arg in "$@"; do
-    case "$arg" in
-        --clean=true) CLEAN_MODE=true ;;
-        --force=true) FORCE=true ;;
-    esac
-done
-
-# ── 自动找管理密钥: env > .mgmt_key > config.yaml明文 ──
-find_mgmt_key() {
-    [ -n "$CPA_MANAGEMENT_KEY" ] && echo "$CPA_MANAGEMENT_KEY" && return
-    for kf in /root/.cli-proxy-api/.mgmt_key ~/.cli-proxy-api/.mgmt_key; do
-        [ -f "$kf" ] && cat "$kf" && return
-    done
-    for cp in /root/cliproxyapi/config.yaml /home/*/cliproxyapi/config.yaml /opt/cliproxyapi/config.yaml; do
-        [ -f "$cp" ] || continue
-        python3 -c "
-import yaml
-with open('$cp') as f:
-    sk = yaml.safe_load(f).get('remote-management',{}).get('secret-key','')
-if not sk.startswith('\$2a\$'): print(sk)
-" 2>/dev/null | grep -v '^\$' && return
-    done
-}
-
-MGMT_KEY="${CPA_MANAGEMENT_KEY:-$(find_mgmt_key)}"
-
-echo "============================================"
-echo " CPA Codex 账号健康检查"
-echo "============================================"
-echo ""
-
-python3 << PYEOF
-import json, os, sys, base64, time, subprocess
-from pathlib import Path
+import json, os, sys, glob, base64, time, argparse, subprocess
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timezone
+from urllib.request import Request, urlopen
+from urllib.error import HTTPError
 
-AUTH_DIR = Path("$AUTH_DIR")
-MGMT_KEY = "$MGMT_KEY"
-CLEAN_MODE = "$CLEAN_MODE" == "true"
-FORCE = "$FORCE" == "true"
-CPA_PORT = "$CPA_PORT"
-now = time.time()
+# ── 配置 ──
+AUTH_DIR = os.environ.get("AUTH_DIR", "/root/.cli-proxy-api")
+CPA_PORT = os.environ.get("CPA_PORT", "8317")
+CPA_URL = f"http://127.0.0.1:{CPA_PORT}"
+MGMT_KEY = os.environ.get("CPA_MANAGEMENT_KEY", "")
+TEST_URL = "https://api.openai.com/v1/models"
+TIMEOUT = 10
+CONCURRENCY = 5
+PLAN_CAPS = {"free": 100, "pro": 500, "max": 2000, "team": 2000}
+
+
+# ═══════════════════════════════════════
+#  公共工具
+# ═══════════════════════════════════════
+
+def find_mgmt_key():
+    if MGMT_KEY:
+        return MGMT_KEY
+    for kf in [os.path.join(AUTH_DIR, ".mgmt_key")]:
+        if os.path.exists(kf):
+            with open(kf) as f:
+                return f.read().strip()
+    return ""
+
+
+def fetch_auth_status():
+    """调用 CPA 管理 API 获取所有账号实时状态"""
+    key = find_mgmt_key()
+    if not key:
+        return {}
+    try:
+        result = subprocess.run(
+            ["curl", "-s", "--max-time", "5",
+             "-H", f"X-Management-Key: {key}",
+             f"http://127.0.0.1:{CPA_PORT}/v0/management/auth-files"],
+            capture_output=True, text=True)
+        return {f["email"]: f for f in json.loads(result.stdout).get("files", []) if f.get("email")}
+    except:
+        return {}
+
 
 def decode_jwt(token):
     try:
-        p = token.split(".")[1]; p += "=" * (4 - len(p) % 4)
+        p = token.split(".")[1]
+        p += "=" * (4 - len(p) % 4)
         return json.loads(base64.urlsafe_b64decode(p))
-    except: return {}
+    except:
+        return {}
 
-def fetch_auth_status():
-    if not MGMT_KEY: return {}
-    try:
-        r = subprocess.run(["curl","-s","--max-time","5",
-            "-H",f"X-Management-Key: {MGMT_KEY}",
-            f"http://127.0.0.1:{CPA_PORT}/v0/management/auth-files"],
-            capture_output=True, text=True)
-        return {f["email"]: f for f in json.loads(r.stdout).get("files",[]) if f.get("email")}
-    except: return {}
 
-api_status = fetch_auth_status()
-print(f"📡 {'已连接' if api_status else '⚠ 未连接'} CPA 管理 API{' (仅检查JWT)' if not api_status else ''}")
-print()
-
-files = sorted(AUTH_DIR.glob("*.json"))
-if not files: print("未找到 auth 文件"); sys.exit(0)
-
-# ── 用量时间线 + 配额估算 ──
-PLAN_CAPS = {"free": 100, "pro": 500, "max": 2000, "team": 2000}
-
-def quota_info(live, plan):
-    if not live: return "", "", ""
+def quota_bar(live, plan):
+    if not live:
+        return ""
     recent = live.get("recent_requests", [])
-    if not recent: return "", "", ""
-
-    # 时间线 (最近12格)
-    slots = recent[-12:]
-    chars = []
-    for r in slots:
-        s, f = r.get("success",0), r.get("failed",0)
-        if s>0 and f==0: chars.append("█")
-        elif f>0 and s==0: chars.append("✗")
-        elif s>0 and f>0: chars.append("▦")
-        else: chars.append("·")
-    ts = sum(r.get("success",0) for r in slots)
-    tf_ = sum(r.get("failed",0) for r in slots)
-    timeline = f"{''.join(chars)} {ts}✓{tf_}✗"
-
-    # 配额估算: 跟踪窗口(~3h) → 推算全天
-    all_s = sum(r.get("success",0) for r in recent)
-    all_f = sum(r.get("failed",0) for r in recent)
-    if len(recent) < 3 or all_s + all_f == 0:
-        return timeline, "", ""
-
+    if len(recent) < 3:
+        return ""
+    all_s = sum(r.get("success", 0) for r in recent)
+    all_f = sum(r.get("failed", 0) for r in recent)
+    if all_s + all_f == 0:
+        return ""
     hours = len(recent) * 10 / 60
     daily = (all_s + all_f) * (24 / max(hours, 1))
     cap = PLAN_CAPS.get(plan, 100)
     pct = min(100, int(daily / cap * 100))
     n = 6
-    f_ = min(n, max(1, int(pct/100*n)))
-    bar = f"{'█'*f_}{'░'*(n-f_)} {pct}%"
-    return timeline, pct, bar
+    f = min(n, max(1, int(pct / 100 * n)))
+    return f"{'█' * f}{'░' * (n - f)} {pct}%"
 
-# ── 分析每个账号 ──
-total = 0
-results = []
 
-for f in files:
-    try:
-        with open(f) as fh: data = json.load(fh)
-    except: continue
-    if data.get("type") != "codex": continue
-    total += 1
+def recent_timeline(live):
+    if not live:
+        return "", 0, 0, 0
+    recent = live.get("recent_requests", [])
+    slots = recent[-12:]
+    chars = []
+    for r in slots:
+        s, f_ = r.get("success", 0), r.get("failed", 0)
+        if s > 0 and f_ == 0:
+            chars.append("█")
+        elif f_ > 0 and s == 0:
+            chars.append("✗")
+        elif s > 0 and f_ > 0:
+            chars.append("▦")
+        else:
+            chars.append("·")
+    ts = sum(r.get("success", 0) for r in slots)
+    tf_ = sum(r.get("failed", 0) for r in slots)
+    return "".join(chars), ts, tf_, ts + tf_
 
-    email = data.get("email","?")
-    plan = data.get("plan_type","free")
-    issues = []
-    severity = "ok"
 
-    # JWT 过期
-    token = data.get("access_token","")
-    jwt_days = 0
-    if token:
-        jwt = decode_jwt(token)
-        exp = jwt.get("exp",0)
-        if exp:
-            jwt_days = (exp - now) / 86400
-            if jwt_days < 0:
-                issues.append("JWT已过期"); severity = "bad"
-            elif jwt_days < 3:
-                issues.append(f"JWT {jwt_days:.0f}天后过期")
-                if severity == "ok": severity = "warn"
+# ═══════════════════════════════════════
+#  模式1: 快速检查 (仅 CPA 管理 API)
+# ═══════════════════════════════════════
 
-    # 业务过期
-    es = data.get("expired","?")
-    if es and es != "?":
+def quick_check():
+    api_status = fetch_auth_status()
+    has_api = bool(api_status)
+    print(f"📡 {'已连接' if has_api else '⚠ 未连接'} CPA 管理 API")
+
+    files = sorted(glob.glob(os.path.join(AUTH_DIR, "*.json")))
+    if not files:
+        print("❌ 没有 auth 文件")
+        return [], api_status, []
+
+    now = time.time()
+    results = []
+    suspected = []  # 近期全失败的账号 (候选待测试)
+
+    for fpath in files:
         try:
-            ed = datetime.fromisoformat(es.replace("Z","+00:00"))
-            if ed.timestamp() < now:
-                issues.append("账号标记过期"); severity = "bad"
-        except: pass
+            with open(fpath) as fh:
+                data = json.load(fh)
+        except:
+            continue
+        if data.get("type") != "codex":
+            continue
 
-    # CPA 实时状态
-    live = api_status.get(email, {})
-    all_time_s = all_time_f = 0
-    if live:
-        recent = live.get("recent_requests",[])
-        all_slots = [(r.get("success",0), r.get("failed",0)) for r in recent]
-        total_s = sum(s for s,_ in all_slots)
-        total_f = sum(f for _,f in all_slots)
-        total_r = total_s + total_f
-        r30_s = sum(s for s,_ in all_slots[-3:])
-        r30_f = sum(f for _,f in all_slots[-3:])
-        r60_s = sum(s for s,_ in all_slots[-6:])
-        r60_f = sum(f for _,f in all_slots[-6:])
+        email = data.get("email", "?")
+        plan = data.get("plan_type", "free")
+        issues = []
+        severity = "ok"
 
-        if total_r > 0 or live.get("unavailable") or live.get("disabled"):
-            if live.get("unavailable"):
-                if r60_s > 0: issues.append("CPA冷却中(曾可用)")
-                elif r60_f > 0: issues.append("额度耗尽/冷却中")
-                else: issues.append("CPA标记不可用")
-                if severity == "ok": severity = "warn"
+        # JWT 过期
+        token = data.get("access_token", "")
+        jwt_days = 0
+        if token:
+            jwt = decode_jwt(token)
+            exp = jwt.get("exp", 0)
+            if exp:
+                jwt_days = (exp - now) / 86400
+                if jwt_days < 0:
+                    issues.append("JWT 已过期")
+                    severity = "bad"
+                elif jwt_days < 3:
+                    issues.append(f"JWT {jwt_days:.0f}d 后过期")
+                    if severity == "ok":
+                        severity = "warn"
+
+        # 业务过期
+        es = data.get("expired", "?")
+        if es and es != "?":
+            try:
+                ed = datetime.fromisoformat(es.replace("Z", "+00:00"))
+                if ed.timestamp() < now:
+                    issues.append("标记已过期")
+                    severity = "bad"
+            except:
+                pass
+
+        # CPA 实时状态
+        live = api_status.get(email, {})
+        all_s = all_f = 0
+        recent_total_s = recent_total_f = 0
+        if live:
+            recent = live.get("recent_requests", [])
+            recent_total_s = sum(r.get("success", 0) for r in recent)
+            recent_total_f = sum(r.get("failed", 0) for r in recent)
+
+            r30 = recent[-3:]
+            r30_s = sum(r.get("success", 0) for r in r30)
+            r30_f = sum(r.get("failed", 0) for r in r30)
 
             if live.get("disabled"):
-                issues.append("已禁用"); severity = "bad"
+                issues.append("🚫 已禁用")
+                severity = "bad"
 
-            # 封号: 从未成功, 只有失败
-            if total_s == 0 and total_f >= 2:
-                issues.append(f"🚫 疑似封号: 累计{total_f}次全失败")
-                severity = "banned"
-            # 额度耗尽: 曾成功, 最近全失败
-            elif total_s > 0 and r30_s == 0 and r30_f >= 1:
+            # 近期全失败 → 需要直连测试确认是401还是额度耗尽
+            if recent_total_s == 0 and recent_total_f >= 2:
+                issues.append(f"全失败 {recent_total_f}次 → 需 --test 确认")
+                if severity == "ok":
+                    severity = "banned"
+                suspected.append({"email": email, "path": fpath, "failed": recent_total_f})
+
+            elif recent_total_s > 0 and r30_s == 0 and r30_f >= 1:
                 issues.append("额度耗尽: 最近无成功")
-                if severity == "ok": severity = "warn"
-            elif total_s > 0 and r60_s == 0 and r60_f >= 2:
-                issues.append("额度耗尽: 最近全部失败")
-                if severity == "ok": severity = "warn"
+                if severity == "ok":
+                    severity = "warn"
 
-            # 失败率
-            if total_r >= 5 and total_f > 0 and severity == "ok":
-                fr = total_f / total_r
-                if fr >= 0.6: issues.append(f"高失败率: {total_f}/{total_r}"); severity = "bad"
-                elif fr >= 0.3: issues.append(f"失败率偏高: {total_f}/{total_r}"); severity = "warn"
+            all_s = live.get("success", 0)
+            all_f = live.get("failed", 0)
 
-        sm = live.get("status_message","")
-        if sm: issues.append(f"状态: {sm}")
-        all_time_s = live.get("success",0)
-        all_time_f = live.get("failed",0)
+        results.append({
+            "email": email, "plan": plan, "severity": severity,
+            "issues": issues, "jwt_days": jwt_days, "path": fpath,
+            "live": live, "all_s": all_s, "all_f": all_f,
+            "recent_s": recent_total_s, "recent_f": recent_total_f,
+        })
 
-    results.append((email, plan, severity, issues, jwt_days, f, all_time_s, all_time_f, live))
+    # 排序
+    sev_order = {"banned": 0, "bad": 1, "warn": 2, "ok": 3}
+    results.sort(key=lambda r: (sev_order.get(r["severity"], 9),
+                                 -r.get("recent_s", 0) - r.get("recent_f", 0)))
 
-# ── 排序 ──
-def sort_key(r):
-    _, _, sev, _, _, _, ok_c, fail_c, live = r
-    sev_order = {"banned":0,"bad":1,"warn":2,"ok":3}
-    recent = live.get("recent_requests",[]) if live else []
-    r_total = sum(rr.get("success",0)+rr.get("failed",0) for rr in recent[-6:])
-    return (sev_order.get(sev,9), -r_total)
-results.sort(key=sort_key)
+    # 打印
+    stats = {"ok": 0, "warn": 0, "bad": 0, "banned": 0}
+    icons = {"ok": "✓", "warn": "⚠", "bad": "✗", "banned": "🚫"}
+    for r in results:
+        icon = icons.get(r["severity"], "?")
+        tl, ts, tf_, _ = recent_timeline(r.get("live"))
+        qb = quota_bar(r.get("live"), r["plan"])
+        line = f"  {icon} {r['email']}"
+        if tl:
+            line += f"  {tl} {ts}✓{tf_}✗"
+        if qb:
+            line += f"  {qb}"
+        line += f"  JWT:{r['jwt_days']:.0f}d"
+        print(line)
+        for iss in r["issues"]:
+            print(f"     ⮡ {iss}")
+        stats[r["severity"]] = stats.get(r["severity"], 0) + 1
 
-# ── 显示 ──
-icons = {"ok":"✓","warn":"⚠","bad":"✗","banned":"🚫"}
-ok_n = warn_n = bad_n = banned_n = 0
+    print()
+    print(f"───")
+    print(f"总计: {len(results)} | ✓{stats.get('ok',0)} ⚠{stats.get('warn',0)} ✗{stats.get('bad',0)} 🚫{stats.get('banned',0)}")
+    print(f"每格=10min  █成功 ·空闲 ✗失败  配额=当日估算")
+    print(f"待确认: {len(suspected)} 个全失败账号 → cpa-health --test")
+    return results, api_status, suspected
 
-for email, plan, sev, issues, jwt_days, f, ok_c, fail_c, live in results:
-    icon = icons.get(sev,"?")
-    timeline, pct, quota_bar = quota_info(live, plan)
 
-    tag = ""
-    if sev not in ("bad","banned","warn"):
-        if live and live.get("unavailable"):
-            tag = " [额度耗尽]"; quota_bar = "██████ 100%"
-        elif ok_c + fail_c == 0:
-            tag = " [新账号]"
+# ═══════════════════════════════════════
+#  模式2: 两步检测 (CPA API → 直连测试)
+# ═══════════════════════════════════════
 
-    line = f"  {icon} {email}"
-    if timeline: line += f"  {timeline}"
-    if quota_bar: line += f"  {quota_bar}"
-    line += f"  JWT:{jwt_days:.0f}d{tag}"
-    print(line)
-    for iss in issues:
-        print(f"     ⮡ {iss}")
+def test_one_account(fpath):
+    """
+    直连 OpenAI API 测试单个账号.
+    返回 (filename, email, status_code, error_msg)
 
-    if sev == "ok":
-        if live and live.get("unavailable"): warn_n += 1
-        else: ok_n += 1
-    elif sev == "warn": warn_n += 1
-    elif sev == "bad": bad_n += 1
-    elif sev == "banned": banned_n += 1
+    状态码含义:
+      401 → token 已失效/被撤销 → 死号, 应清理
+      403 → token 有效但无 models 权限 (OAuth 免费账号没有 models 权限)
+             ↓ 实际含义: 额度用光或 API 限制, token 本身有效, 不应清理
+      200 → token 有效
+      429 → 限流, token 有效
+    """
+    try:
+        data = json.load(open(fpath))
+    except Exception as e:
+        return (os.path.basename(fpath), "?", -9, str(e))
 
-print()
-print("───")
-print(f"总计: {total} | ✓{ok_n} ⚠{warn_n} ✗{bad_n} 🚫{banned_n}")
-print(f"每格=10min  █成功 ·空闲 ✗失败  配额=当日估算")
+    email = data.get("email", "?")
+    token = data.get("access_token", "")
 
-# ── 清理 ──
-to_clean = [r for r in results if r[2] in ("bad","banned")]
-if to_clean:
-    print(f"\n建议清理 ({len(to_clean)} 个):")
-    for r in to_clean:
-        print(f"  {icons[r[2]]} {r[0]}  {'|'.join(r[3])}")
-    if CLEAN_MODE:
-        print(f"\n将要删除 {len(to_clean)} 个问题账号:")
-        for r in to_clean:
-            print(f"  - {r[0]}    {'|'.join(r[3])}")
-        if not FORCE:
-            try: resp = input("\n确认删除? [y/N] ").strip().lower()
-            except EOFError: resp = "n"
-            if resp not in ("y","yes"): print("已取消"); sys.exit(0)
-        for r in to_clean:
-            try: r[5].unlink()
-            except: pass
-        print(f"\n✅ 已删除 {len(to_clean)} 个问题账号")
-        print("   CPA 文件监控会自动感知变更")
-elif not CLEAN_MODE:
-    print("\n运行 cpa-health --clean 清理问题账号")
+    if not token:
+        return (os.path.basename(fpath), email, -2, "无 access_token")
 
-PYEOF
+    req = Request(TEST_URL)
+    req.add_header("Authorization", f"Bearer {token}")
+    req.add_header("User-Agent", "cpa-health/2.0")
+
+    try:
+        resp = urlopen(req, timeout=TIMEOUT)
+        resp.read()
+        return (os.path.basename(fpath), email, resp.status, "")
+    except HTTPError as e:
+        body = ""
+        try:
+            body = e.read().decode()[:200]
+        except:
+            pass
+        return (os.path.basename(fpath), email, e.code, body)
+    except Exception as e:
+        err = str(e)[:100]
+        if "401" in err:
+            return (os.path.basename(fpath), email, 401, err)
+        return (os.path.basename(fpath), email, -1, err)
+
+
+def two_step_test():
+    """
+    两步检测:
+      Step 1: CPA 管理 API → 找出近期全失败的账号
+      Step 2: 只对失败账号直连 OpenAI 测试状态码
+    避免浪费正常账号的请求额度.
+    """
+    # ── Step 1: 从 CPA API 获取失败账号列表 ──
+    print("═" * 55)
+    print("  Step 1: 查询 CPA 管理 API → 筛选失败账号")
+    print("═" * 55)
+
+    api_status = fetch_auth_status()
+    if not api_status:
+        print("❌ 无法连接 CPA 管理 API, 请检查 CPA_MANAGEMENT_KEY")
+        return {}, []
+
+    all_files = sorted(glob.glob(os.path.join(AUTH_DIR, "*.json")))
+    failed_accounts = []  # [(fpath, email, failed_count)]
+    working_count = 0
+    idle_count = 0
+
+    for fpath in all_files:
+        try:
+            data = json.load(open(fpath))
+            if data.get("type") != "codex":
+                continue
+        except:
+            continue
+
+        email = data.get("email", "?")
+        live = api_status.get(email, {})
+        if not live:
+            idle_count += 1
+            continue
+
+        recent = live.get("recent_requests", [])
+        total_s = sum(r.get("success", 0) for r in recent)
+        total_f = sum(r.get("failed", 0) for r in recent)
+
+        if total_s == 0 and total_f >= 1:
+            failed_accounts.append((fpath, email, total_f))
+        elif total_s > 0:
+            working_count += 1
+        else:
+            idle_count += 1
+
+    total_codex = len(failed_accounts) + working_count + idle_count
+    print(f"  账号总数: {total_codex}")
+    print(f"  ✅ 正常 (有成功): {working_count}  → 跳过, 不浪费额度")
+    print(f"  😴 闲置 (无请求): {idle_count}  → 跳过")
+    print(f"  ❓ 全失败 (需确认): {len(failed_accounts)} → 进入 Step 2")
+    print()
+
+    if not failed_accounts:
+        print("✅ 没有需要确认的失败账号")
+        return {}, []
+
+    # ── Step 2: 只对失败账号直连测试 ──
+    print("═" * 55)
+    print(f"  Step 2: 直连 OpenAI 测试 {len(failed_accounts)} 个失败账号")
+    print(f"  (只测失败号, 不影响 {working_count} 个正常账号)")
+    print("═" * 55)
+    print(f"  URL: {TEST_URL}")
+    print()
+
+    results = {}
+    total = len(failed_accounts)
+
+    with ThreadPoolExecutor(max_workers=CONCURRENCY) as pool:
+        futures = {pool.submit(test_one_account, fp): (fp, em, fc)
+                   for fp, em, fc in failed_accounts}
+        done = 0
+        for future in as_completed(futures):
+            fname, email, code, msg = future.result()
+            done += 1
+            key = str(code)
+            results.setdefault(key, [])
+            results[key].append((fname, email, msg))
+
+            if code == 401:
+                icon = "🔴"
+            elif code == 403:
+                icon = "🟡"  # 额度用光, 非401
+            elif code == 200:
+                icon = "✅"
+            elif code == 429:
+                icon = "🟡"
+            else:
+                icon = "❓"
+
+            short = email.split("@")[0] if "@" in email else email
+            if len(short) > 30:
+                short = short[:27] + "..."
+            print(f"  [{done:3d}/{total}] {icon} {code} | {short}")
+
+    print()
+    print("═" * 55)
+    print("  状态码分布")
+    print("═" * 55)
+    for code in sorted(results.keys(), key=lambda x: (not x.lstrip("-").isdigit(),
+                        int(x) if x.lstrip("-").isdigit() else 0)):
+        lst = results[code]
+        label = {
+            "200": "✅ 完全可用",
+            "401": "🔴 TOKEN失效 → 可清理",
+            "429": "🟡 限流中 → 保留",
+            "403": "🟡 额度耗尽/无权限 → 保留 (token有效)",
+            "-1": "❓ 连接错误 → 保留",
+            "-2": "⚠ 无token → 保留",
+            "-9": "❌ 解析失败 → 保留",
+        }.get(code, "")
+        print(f"  {code} {label}: {len(lst)} 个")
+    print()
+
+    # 列 401
+    dead_401 = results.get("401", [])
+    if dead_401:
+        print(f"🔴 401 TOKEN失效 ({len(dead_401)} 个) — 只有这些该删:")
+        for fname, email, msg in dead_401:
+            if msg:
+                try:
+                    err = json.loads(msg) if msg.startswith("{") else {"error": msg}
+                    detail = err.get("error", {}).get("message", "") if isinstance(err.get("error"), dict) else str(err.get("error", msg))[:100]
+                except:
+                    detail = msg[:100]
+            else:
+                detail = ""
+            print(f"  → {fname}")
+            if detail:
+                print(f"     {detail}")
+        print()
+
+    dead_403 = results.get("403", [])
+    if dead_403:
+        print(f"🟡 403 额度耗尽 ({len(dead_403)} 个) — 不删, token 有效只是没额度了")
+        print()
+
+    return results, failed_accounts
+
+
+def clean_401(results, force=False):
+    """删除 401 死号"""
+    dead = results.get("401", [])
+    if not dead:
+        print("✅ 没有 401 死号")
+        return 0
+
+    print(f"⚠️  将删除 {len(dead)} 个 401 死号:")
+    for fname, email, msg in dead:
+        print(f"  🗑  {fname}")
+
+    if not force:
+        try:
+            ans = input(f"\n确认删除? [y/N]: ").strip().lower()
+        except EOFError:
+            ans = "n"
+        if ans not in ("y", "yes"):
+            print("已取消")
+            return 0
+
+    deleted = 0
+    for fname, _, _ in dead:
+        fpath = os.path.join(AUTH_DIR, fname)
+        try:
+            os.remove(fpath)
+            print(f"  ✓ 已删: {fname}")
+            deleted += 1
+        except Exception as e:
+            print(f"  ✗ 失败: {fname} - {e}")
+
+    print(f"\n✅ 清理完成: {deleted} 个 401 死号")
+    print(f"   CPA 文件监控会自动感知变更")
+    return deleted
+
+
+# ═══════════════════════════════════════
+#  main
+# ═══════════════════════════════════════
+
+def main():
+    parser = argparse.ArgumentParser(description="CPA Codex 账号健康检查 / 清理 (两步检测法)")
+    parser.add_argument("--test", action="store_true",
+                        help="两步检测: CPA API找失败号 → 直连测试状态码 (只测失败号, 不浪费正常额度)")
+    parser.add_argument("--clean", action="store_true",
+                        help="清理死号 (--test 模式只删 401; 默认模式删 banned+bad)")
+    parser.add_argument("--force", "-f", action="store_true", help="跳过确认")
+    parser.add_argument("--watch", nargs="?", const=10, type=int, help="实时监测")
+    args = parser.parse_args()
+
+    if args.watch:
+        self_path = os.path.realpath(__file__)
+        extra = []
+        if args.test:
+            extra.append("--test")
+        while True:
+            os.system("clear 2>/dev/null || printf '\\033[2J\\033[H'")
+            os.system(f"python3 {self_path} {' '.join(extra)} 2>/dev/null")
+            print()
+            print(f"🔄 每 {args.watch}s 刷新 | Ctrl-C 退出 | {datetime.now().strftime('%H:%M:%S')}")
+            time.sleep(args.watch)
+        return
+
+    if args.test:
+        results, _ = two_step_test()
+        if args.clean:
+            clean_401(results, args.force)
+    else:
+        results, api_status, suspected = quick_check()
+        if args.clean:
+            to_clean = [r for r in results if r["severity"] in ("banned", "bad")]
+            if not to_clean:
+                print("\n✅ 没有问题账号")
+                return
+            print(f"\n⚠️  将清理 {len(to_clean)} 个问题账号:")
+            for r in to_clean:
+                print(f"  {'🚫' if r['severity']=='banned' else '✗'} {r['email']}")
+            if not args.force:
+                try:
+                    ans = input(f"\n确认删除? [y/N]: ").strip().lower()
+                except EOFError:
+                    ans = "n"
+                if ans not in ("y", "yes"):
+                    print("已取消")
+                    return
+            for r in to_clean:
+                try:
+                    os.remove(r["path"])
+                    print(f"  ✓ 已删: {os.path.basename(r['path'])}")
+                except Exception as e:
+                    print(f"  ✗ 失败: {r['path']} - {e}")
+            print(f"\n✅ 清理完成: {len(to_clean)} 个")
+        else:
+            if suspected:
+                print(f"\n⚠️  {len(suspected)} 个全失败账号待确认 → cpa-health --test")
+            else:
+                print("\n✅ 所有账号正常")
+            print("运行 cpa-health --test --clean  两步检测并清理401死号")
+
+
+if __name__ == "__main__":
+    main()
